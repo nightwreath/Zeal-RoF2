@@ -396,22 +396,38 @@ static bool is_mouse_over_ui_window() {
   void *const mgr =
       *reinterpret_cast<void **>(k_wnd_mgr_global_ghidra + g_aslr_delta);
   if (mgr == nullptr) return false;
-  void *const hovered = *reinterpret_cast<void **>(
-      reinterpret_cast<char *>(mgr) + k_cxwndmgr_hovered_offset);
-  const bool over_ui = (hovered != nullptr);
+  const unsigned *const fields = reinterpret_cast<const unsigned *>(mgr);
+  // Check three transient/cursor-tracking fields, any of which being
+  // non-null means cursor is interacting with UI:
+  //   0x68: transient drag/capture-like (per Session 15 static analysis).
+  //         Slider thumb drags appear to register here while 0x70 stays
+  //         null (Alex S44 follow-up report — Bug #1 STILL fires on
+  //         LOD Bias slider after the per-frame 0x70 re-check fix).
+  //   0x70: Hovered — current cursor's topmost widget (primary signal).
+  //   0x74: tracks 0x70 most of the time; occasional drag-like
+  //         discrepancies (e.g. dragged-thumb still under cursor).
+  //
+  // 0x5C (Focused, sticky) intentionally EXCLUDED — Focused stays set to
+  // whatever window last had keyboard focus (loot, chat input), so checking
+  // it would suppress pan whenever any UI window had recent focus. The
+  // S44 hit-test log confirmed 0x5C was non-null during normal world play.
+  const bool over_ui = (fields[0x68 / 4] != 0) ||
+                       (fields[0x70 / 4] != 0) ||
+                       (fields[0x74 / 4] != 0);
 #if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE
-  // Log first 10 hit-test calls with all four candidate field values so we
-  // can verify 0x70 is still the right choice (vs 0x5C / 0x68 / 0x74) on
-  // re-test. After 10 calls, log goes silent.
+  // Bumped from 10 → 500 in S44 follow-up so a slider-drag test can
+  // capture enough hit-tests to identify which field actually triggers
+  // (if any). Logs every call including ALLOW decisions so Alex can grep
+  // the log around the moment of a slider drag and see what fields look
+  // like vs world-hover.
   static int s_diag_count = 0;
-  if (s_diag_count < 10) {
+  if (s_diag_count < 500) {
     s_diag_count++;
-    const unsigned *p = reinterpret_cast<const unsigned *>(mgr);
     diag_logf("[hit-test #%d] mgr=0x%x  0x5c=%08x 0x64=%08x 0x68=%08x "
               "0x70=%08x 0x74=%08x  decision=%s\n",
               s_diag_count, (unsigned)(uintptr_t)mgr,
-              p[0x5C / 4], p[0x64 / 4], p[0x68 / 4],
-              p[0x70 / 4], p[0x74 / 4],
+              fields[0x5C / 4], fields[0x64 / 4], fields[0x68 / 4],
+              fields[0x70 / 4], fields[0x74 / 4],
               over_ui ? "SUPPRESS" : "ALLOW");
   }
 #endif
