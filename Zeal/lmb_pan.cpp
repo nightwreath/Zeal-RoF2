@@ -88,7 +88,7 @@
 // D:\EQEmu\Full_RoF2\lmb_pan_diag.log. Friend builds ship with this OFF —
 // the install popup would otherwise fire every DLL load, and the log file
 // would grow unbounded across play sessions.
-#define ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE 0
+#define ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE 1
 // Sub-flag: the [pan-frame N] per-wrapper-call log fires from inside the
 // camera wrapper, which runs multiple times per visual frame. With the
 // per-call fflush in diag_logf this caused enough synchronous disk I/O to
@@ -519,9 +519,24 @@ static void poll_input() {
       g_recenter_pending = false;
       g_state = lmb_state::HELD;
     } else if (g_state == lmb_state::PENDING) {
-      // No pan committed yet — drop back to IDLE so we don't auto-engage
-      // when focus returns.
-      g_state = lmb_state::IDLE;
+      // PENDING dropped on focus loss. If offsets are non-zero, this PENDING
+      // came from a HELD→PENDING re-engagement (user re-pressed LMB while
+      // holding a prior pan-angle) — demote to HELD so the next RMB can snap
+      // back. If offsets are zero, this was a cold IDLE→PENDING (user just
+      // pressed LMB with no prior pan); drop to IDLE and clear g_pitch_
+      // snapshotted so the next pan-enter captures a fresh pitch base.
+      //
+      // Defect A3/B1 fix (S44 — captured live in alt-tab+LMB-down+alt-tab
+      // log capture): the prior unconditional demotion to IDLE while offsets
+      // were non-zero violated the state-machine invariant "IDLE = no
+      // offset", left g_pitch_snapshotted stale, and lost the RMB→snap-back
+      // affordance (RMB→IDLE is a no-op when already IDLE).
+      if (g_yaw_offset == 0.0f && g_pitch_offset == 0.0f) {
+        g_state = lmb_state::IDLE;
+        g_pitch_snapshotted = false;
+      } else {
+        g_state = lmb_state::HELD;
+      }
     }
     return;
   }
