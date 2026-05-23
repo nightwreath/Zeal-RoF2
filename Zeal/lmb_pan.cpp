@@ -128,10 +128,50 @@ static const size_t k_entity_heading_byte_offset = 0x80;
 using slot_08_fn = void(__fastcall *)(void *cam, int edx_unused, int *entity);
 static slot_08_fn g_original = nullptr;
 
+// Bug B2 fix (S44 — mode-switch leak): poll-and-chain wrappers on every
+// non-mode-6 camera class so the state machine ticks even when active
+// mode != 6. Without these, F9-cycle or scroll-to-1st-person mid-PANNING
+// leaves cursor hidden + ClipCursor active + state stuck at PANNING
+// until user gets back to mode 6 AND presses RMB. Per-mode originals are
+// populated by install(); per-mode wrappers (defined alongside
+// mode_6_wrapper below) just call poll_input() + chain to their original.
+//
+// Vtable + slot 0x08 addresses from project_zeal_rof2_camera.md (Session
+// 14 empirical mode probe). Each vtable is at the class address; slot
+// 0x08 is at vtable + 8.
+static const uintptr_t k_mode_0_vtable_slot_08_ghidra = 0x009d0f88;  // 1st-person
+static const uintptr_t k_mode_1_vtable_slot_08_ghidra = 0x009d10d0;  // F9 alt
+static const uintptr_t k_mode_2_vtable_slot_08_ghidra = 0x009d1110;  // F9 alt (ZealCam target upstream)
+static const uintptr_t k_mode_3_4_7_vtable_slot_08_ghidra = 0x009d1150;  // shared class for modes 3/4/7
+static const uintptr_t k_mode_5_vtable_slot_08_ghidra = 0x009d11d0;  // unverified
+static const uintptr_t k_mode_8_vtable_slot_08_ghidra = 0x009d0fd0;  // unverified
+
+static const uintptr_t k_mode_0_slot_08_original_ghidra = 0x00797160;
+static const uintptr_t k_mode_1_slot_08_original_ghidra = 0x007982d0;
+static const uintptr_t k_mode_2_slot_08_original_ghidra = 0x00796920;
+static const uintptr_t k_mode_3_4_7_slot_08_original_ghidra = 0x00798c90;
+static const uintptr_t k_mode_5_slot_08_original_ghidra = 0x007986b0;
+static const uintptr_t k_mode_8_slot_08_original_ghidra = 0x007980a0;
+
+static slot_08_fn g_original_mode_0 = nullptr;
+static slot_08_fn g_original_mode_1 = nullptr;
+static slot_08_fn g_original_mode_2 = nullptr;
+static slot_08_fn g_original_mode_3_4_7 = nullptr;
+static slot_08_fn g_original_mode_5 = nullptr;
+static slot_08_fn g_original_mode_8 = nullptr;
+
 // Stored at install time so the wrapper can read DAT_00ddf703 (the heading-
 // update path selector) without re-deriving the ASLR delta.
 static uintptr_t g_aslr_delta = 0;
 static const uintptr_t k_dat_00ddf703_ghidra = 0x00ddf703;
+
+// Active camera mode index (per project_zeal_rof2_addresses.md). Values:
+//   0 = 1st-person, 1/2/3/4/8 = F9-cycle alts, 5 = unverified, 6 = vanilla
+//   scroll-out 3rd-person (our LMB-pan target), 7 = character-select.
+// Used in poll_input (Bug B2 fix) to gate IDLE→PENDING / HELD→PENDING
+// transitions to mode 6 only, and to detect mode-switch-while-PANNING
+// for cursor-state cleanup.
+static const uintptr_t k_dat_active_mode_ghidra = 0x00d1fd9c;
 
 // Runtime shadow of MouseSensitivity bucket (1-8). Session 11 decode:
 //   loadOptions tail copies ini storage DAT_00de0be4 → runtime shadow
@@ -572,9 +612,36 @@ static void poll_input() {
   const bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
   const bool rmb = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
 
+  // Bug B2 (S44): read the active camera mode index. Used to:
+  //   (a) Detect mode-switch (F9 cycle, scroll-to-1st-person) mid-PANNING
+  //       and clean up cursor state — without this, ShowCursor stays
+  //       decremented + ClipCursor stays set + state stays PANNING until
+  //       user gets back to mode 6 AND presses RMB.
+  //   (b) Gate IDLE→PENDING and HELD→PENDING transitions to mode 6 only.
+  //       Pan-engagement from other modes doesn't make sense (mode_6_wrapper
+  //       isn't firing to apply offsets to cam state) and would just
+  //       accumulate invisible yaw/pitch.
+  const int active_mode = *reinterpret_cast<int *>(
+      k_dat_active_mode_ghidra + g_aslr_delta);
+  if (active_mode != 6 && g_state == lmb_state::PANNING) {
+    ClipCursor(nullptr);
+    while (g_hides_applied > 0) {
+      ShowCursor(TRUE);
+      g_hides_applied--;
+    }
+    g_recenter_pending = false;
+    g_state = lmb_state::HELD;
+#if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE
+    diag_logf("[mode-switch] active_mode=%d != 6 → demoted PANNING to HELD "
+              "(offsets persist: yaw=%+.3f pitch=%+.3f)\n",
+              active_mode, g_yaw_offset, g_pitch_offset);
+#endif
+  }
+
   switch (g_state) {
     case lmb_state::IDLE:
-      if (lmb && !rmb && !is_mouse_over_ui_window()) {
+      // Bug B2 gate: pan engagement only from mode 6.
+      if (active_mode == 6 && lmb && !rmb && !is_mouse_over_ui_window()) {
         // Bug #8 gate — see is_cursor_inside_eq_window() comment.
         POINT cur;
         if (is_cursor_inside_eq_window(&cur)) {
@@ -619,6 +686,27 @@ static void poll_input() {
         exit_to_idle_snapping_back();
       } else if (!lmb) {
         enter_held_keeping_offset();
+      } else if (is_mouse_over_ui_window()) {
+        // Bug B3 fix (S44): cursor moved over a UI window mid-pan.
+        // Without this check, the pan continues to accumulate yaw/pitch
+        // while EQ engine drags whatever UI element is under the cursor
+        // (sliders specifically — Bug #1 root cause). Release our cursor
+        // controls and demote to HELD so EQ can handle the UI interaction.
+        // Do NOT SetCursorPos — user's cursor is already on the UI
+        // element where they want to interact. Offsets persist; RMB still
+        // snaps back from HELD if desired.
+        ClipCursor(nullptr);
+        while (g_hides_applied > 0) {
+          ShowCursor(TRUE);
+          g_hides_applied--;
+        }
+        g_recenter_pending = false;
+        g_state = lmb_state::HELD;
+#if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE
+        diag_logf("[pan-exit-ui] cursor over UI mid-pan; demoted to HELD "
+                  "(yaw=%+.3f pitch=%+.3f)\n",
+                  g_yaw_offset, g_pitch_offset);
+#endif
       } else {
         POINT current;
         GetCursorPos(&current);
@@ -691,12 +779,15 @@ static void poll_input() {
     case lmb_state::HELD:
       if (rmb) {
         // RMB while a pan is held: instant snap-back per spec.
+        // Note: snap-back is mode-AGNOSTIC — user can snap back held
+        // offsets even from a different camera mode they switched into.
         exit_to_idle_snapping_back();
-      } else if (lmb && !is_mouse_over_ui_window()) {
+      } else if (active_mode == 6 && lmb && !is_mouse_over_ui_window()) {
         // LMB pressed from HELD: re-engage. Offsets persist (we DON'T reset
         // them here or in enter_panning); further drag stacks on the held
         // angle.
-        // Bug #8 gate — taskbar click while HELD shouldn't re-engage pan.
+        // Bug B2 gate: pan re-engagement only from mode 6.
+        // Bug #8 gate: taskbar click while HELD shouldn't re-engage pan.
         POINT cur;
         if (is_cursor_inside_eq_window(&cur)) {
           g_lmb_down_cursor = cur;
@@ -708,6 +799,38 @@ static void poll_input() {
       // pitch block).
       break;
   }
+}
+
+// Per-mode poll-and-chain wrappers (Bug B2 fix). Each fires per render
+// frame while its mode is active. They do NOTHING with cam state — just
+// call poll_input() so the state machine can see input + transition
+// (particularly the PANNING-to-HELD demote on mode-switch when active
+// mode != 6), then chain to the per-mode original anchor compute.
+// Mode 6 has its own dedicated wrapper below that does the full
+// yaw/pitch cam-write work; these are the lightweight siblings.
+static void __fastcall mode_0_wrapper(void *cam, int /*edx*/, int *entity) {
+  poll_input();
+  if (g_original_mode_0) g_original_mode_0(cam, 0, entity);
+}
+static void __fastcall mode_1_wrapper(void *cam, int /*edx*/, int *entity) {
+  poll_input();
+  if (g_original_mode_1) g_original_mode_1(cam, 0, entity);
+}
+static void __fastcall mode_2_wrapper(void *cam, int /*edx*/, int *entity) {
+  poll_input();
+  if (g_original_mode_2) g_original_mode_2(cam, 0, entity);
+}
+static void __fastcall mode_3_4_7_wrapper(void *cam, int /*edx*/, int *entity) {
+  poll_input();
+  if (g_original_mode_3_4_7) g_original_mode_3_4_7(cam, 0, entity);
+}
+static void __fastcall mode_5_wrapper(void *cam, int /*edx*/, int *entity) {
+  poll_input();
+  if (g_original_mode_5) g_original_mode_5(cam, 0, entity);
+}
+static void __fastcall mode_8_wrapper(void *cam, int /*edx*/, int *entity) {
+  poll_input();
+  if (g_original_mode_8) g_original_mode_8(cam, 0, entity);
 }
 
 static void __fastcall mode_6_wrapper(void *cam, int /*edx_unused*/, int *entity) {
@@ -864,6 +987,40 @@ static void __fastcall mode_6_wrapper(void *cam, int /*edx_unused*/, int *entity
 #endif
 }
 
+// Bug B2 helper (S44): install a non-mode-6 vtable slot 0x08 wrapper.
+// Returns true on success, false on signature mismatch (silently skipped —
+// mismatch on a single non-mode-6 mode means PANNING leak will persist on
+// THAT mode-switch but not catastrophic; mode-6 install is the only
+// must-succeed slot). Logs install/skip decision when DIAGNOSE is on.
+static bool install_aux_mode_wrapper(uintptr_t slot_ghidra,
+                                     uintptr_t expected_original_ghidra,
+                                     void *new_fn,
+                                     slot_08_fn *out_original,
+                                     uintptr_t aslr_delta,
+                                     const char *mode_label) {
+  const uintptr_t slot_runtime = slot_ghidra + aslr_delta;
+  const uintptr_t expected_runtime = expected_original_ghidra + aslr_delta;
+  uintptr_t *const slot_ptr = reinterpret_cast<uintptr_t *>(slot_runtime);
+  const uintptr_t actual = *slot_ptr;
+  const bool match = (actual == expected_runtime);
+#if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE
+  diag_logf("[install-aux] mode=%s slot=0x%08x expected=0x%08x actual=0x%08x "
+            "match=%s decision=%s\n",
+            mode_label,
+            (unsigned)slot_runtime, (unsigned)expected_runtime,
+            (unsigned)actual,
+            match ? "YES" : "NO", match ? "INSTALL" : "SKIP");
+#endif
+  if (!match) return false;
+  *out_original = reinterpret_cast<slot_08_fn>(actual);
+  DWORD old_protect;
+  VirtualProtect(slot_ptr, sizeof(uintptr_t), PAGE_READWRITE, &old_protect);
+  *slot_ptr = reinterpret_cast<uintptr_t>(new_fn);
+  VirtualProtect(slot_ptr, sizeof(uintptr_t), old_protect, &old_protect);
+  FlushInstructionCache(GetCurrentProcess(), slot_ptr, sizeof(uintptr_t));
+  return true;
+}
+
 bool install(uintptr_t aslr_delta) {
   g_aslr_delta = aslr_delta;
 
@@ -912,6 +1069,39 @@ bool install(uintptr_t aslr_delta) {
   *slot_ptr = reinterpret_cast<uintptr_t>(&mode_6_wrapper);
   VirtualProtect(slot_ptr, sizeof(uintptr_t), old_protect, &old_protect);
   FlushInstructionCache(GetCurrentProcess(), slot_ptr, sizeof(uintptr_t));
+
+  // Bug B2 fix (S44): install poll-and-chain wrappers on every other
+  // camera mode's vtable slot 0x08 too, so the state machine ticks even
+  // when active mode != 6. Each individual install is non-fatal on
+  // signature mismatch (only mode-6 is required). Worst case = PANNING
+  // leak persists on that one specific mode-switch direction.
+  install_aux_mode_wrapper(k_mode_0_vtable_slot_08_ghidra,
+                           k_mode_0_slot_08_original_ghidra,
+                           &mode_0_wrapper, &g_original_mode_0,
+                           aslr_delta, "0 (1st-person)");
+  install_aux_mode_wrapper(k_mode_1_vtable_slot_08_ghidra,
+                           k_mode_1_slot_08_original_ghidra,
+                           &mode_1_wrapper, &g_original_mode_1,
+                           aslr_delta, "1 (F9 alt)");
+  install_aux_mode_wrapper(k_mode_2_vtable_slot_08_ghidra,
+                           k_mode_2_slot_08_original_ghidra,
+                           &mode_2_wrapper, &g_original_mode_2,
+                           aslr_delta, "2 (F9 alt)");
+  install_aux_mode_wrapper(k_mode_3_4_7_vtable_slot_08_ghidra,
+                           k_mode_3_4_7_slot_08_original_ghidra,
+                           &mode_3_4_7_wrapper, &g_original_mode_3_4_7,
+                           aslr_delta, "3/4/7 (shared)");
+  install_aux_mode_wrapper(k_mode_5_vtable_slot_08_ghidra,
+                           k_mode_5_slot_08_original_ghidra,
+                           &mode_5_wrapper, &g_original_mode_5,
+                           aslr_delta, "5");
+  install_aux_mode_wrapper(k_mode_8_vtable_slot_08_ghidra,
+                           k_mode_8_slot_08_original_ghidra,
+                           &mode_8_wrapper, &g_original_mode_8,
+                           aslr_delta, "8");
+#if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE
+  diag_flush();
+#endif
 
   return true;
 }
