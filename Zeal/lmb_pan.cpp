@@ -88,7 +88,7 @@
 // D:\EQEmu\Full_RoF2\lmb_pan_diag.log. Friend builds ship with this OFF —
 // the install popup would otherwise fire every DLL load, and the log file
 // would grow unbounded across play sessions.
-#define ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE 1
+#define ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE 0
 // Sub-flag: the [pan-frame N] per-wrapper-call log fires from inside the
 // camera wrapper, which runs multiple times per visual frame. With the
 // per-call fflush in diag_logf this caused enough synchronous disk I/O to
