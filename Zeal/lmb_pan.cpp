@@ -89,6 +89,13 @@
 // the install popup would otherwise fire every DLL load, and the log file
 // would grow unbounded across play sessions.
 #define ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE 0
+// Sub-flag: the [pan-frame N] per-wrapper-call log fires from inside the
+// camera wrapper, which runs multiple times per visual frame. With the
+// per-call fflush in diag_logf this caused enough synchronous disk I/O to
+// visibly throttle the renderer ("camera feels wild / spins erratically").
+// Default OFF so the lighter state-transition logs can stay enabled. Flip to
+// 1 only when investigating per-frame yaw/pitch math.
+#define ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE_PER_FRAME 0
 
 namespace lmb_pan {
 
@@ -121,10 +128,50 @@ static const size_t k_entity_heading_byte_offset = 0x80;
 using slot_08_fn = void(__fastcall *)(void *cam, int edx_unused, int *entity);
 static slot_08_fn g_original = nullptr;
 
+// Bug B2 fix (S44 — mode-switch leak): poll-and-chain wrappers on every
+// non-mode-6 camera class so the state machine ticks even when active
+// mode != 6. Without these, F9-cycle or scroll-to-1st-person mid-PANNING
+// leaves cursor hidden + ClipCursor active + state stuck at PANNING
+// until user gets back to mode 6 AND presses RMB. Per-mode originals are
+// populated by install(); per-mode wrappers (defined alongside
+// mode_6_wrapper below) just call poll_input() + chain to their original.
+//
+// Vtable + slot 0x08 addresses from project_zeal_rof2_camera.md (Session
+// 14 empirical mode probe). Each vtable is at the class address; slot
+// 0x08 is at vtable + 8.
+static const uintptr_t k_mode_0_vtable_slot_08_ghidra = 0x009d0f88;  // 1st-person
+static const uintptr_t k_mode_1_vtable_slot_08_ghidra = 0x009d10d0;  // F9 alt
+static const uintptr_t k_mode_2_vtable_slot_08_ghidra = 0x009d1110;  // F9 alt (ZealCam target upstream)
+static const uintptr_t k_mode_3_4_7_vtable_slot_08_ghidra = 0x009d1150;  // shared class for modes 3/4/7
+static const uintptr_t k_mode_5_vtable_slot_08_ghidra = 0x009d11d0;  // unverified
+static const uintptr_t k_mode_8_vtable_slot_08_ghidra = 0x009d0fd0;  // unverified
+
+static const uintptr_t k_mode_0_slot_08_original_ghidra = 0x00797160;
+static const uintptr_t k_mode_1_slot_08_original_ghidra = 0x007982d0;
+static const uintptr_t k_mode_2_slot_08_original_ghidra = 0x00796920;
+static const uintptr_t k_mode_3_4_7_slot_08_original_ghidra = 0x00798c90;
+static const uintptr_t k_mode_5_slot_08_original_ghidra = 0x007986b0;
+static const uintptr_t k_mode_8_slot_08_original_ghidra = 0x007980a0;
+
+static slot_08_fn g_original_mode_0 = nullptr;
+static slot_08_fn g_original_mode_1 = nullptr;
+static slot_08_fn g_original_mode_2 = nullptr;
+static slot_08_fn g_original_mode_3_4_7 = nullptr;
+static slot_08_fn g_original_mode_5 = nullptr;
+static slot_08_fn g_original_mode_8 = nullptr;
+
 // Stored at install time so the wrapper can read DAT_00ddf703 (the heading-
 // update path selector) without re-deriving the ASLR delta.
 static uintptr_t g_aslr_delta = 0;
 static const uintptr_t k_dat_00ddf703_ghidra = 0x00ddf703;
+
+// Active camera mode index (per project_zeal_rof2_addresses.md). Values:
+//   0 = 1st-person, 1/2/3/4/8 = F9-cycle alts, 5 = unverified, 6 = vanilla
+//   scroll-out 3rd-person (our LMB-pan target), 7 = character-select.
+// Used in poll_input (Bug B2 fix) to gate IDLE→PENDING / HELD→PENDING
+// transitions to mode 6 only, and to detect mode-switch-while-PANNING
+// for cursor-state cleanup.
+static const uintptr_t k_dat_active_mode_ghidra = 0x00d1fd9c;
 
 // Runtime shadow of MouseSensitivity bucket (1-8). Session 11 decode:
 //   loadOptions tail copies ini storage DAT_00de0be4 → runtime shadow
@@ -217,6 +264,16 @@ static bool g_pitch_restore_pending = false; // Set on exit; wrapper restores on
 static POINT g_pre_set_cursor = {0, 0};
 static bool g_recenter_pending = false;
 
+// Post-snap-back diagnostic: after RMB triggers a snap-back out of PANNING
+// or PENDING-with-offsets, log the next N wrapper frames. We want to confirm
+// whether EQ's "both buttons held = autorun forward" engages while the user
+// is still physically holding LMB+RMB. If autorun engaged we'll see cam[1..3]
+// (position) drift forward across frames; if not, position stays steady.
+// Also captures the raw GetAsyncKeyState(VK_LBUTTON/VK_RBUTTON) bits so we
+// can confirm Windows still reports both as held post-snap-back.
+static int g_post_snap_log_remaining = 0;
+static const int k_post_snap_log_frames = 90;  // ~1.5s at 60fps
+
 // Pixel-distance threshold before LMB-down commits to a pan (vs being a
 // click). WoW uses a "tiny hidden distance" — just enough to filter hand
 // tremor on a deliberate click, not a deliberate intent gate. Starting at
@@ -248,11 +305,16 @@ static const float k_mouse_to_pitch_units = 0.09f;
 
 // Pitch clamp range. cam[0x2c] (a sibling field, not the one we use) is
 // clamped to [0, 30] in mode 5 — circumstantial evidence that EQ pitches
-// live in roughly the [0, 30] range. We allow ±60 here (wider than circum-
-// stantial guess) so first empirical test can see whether cam[0x30] reaches
-// position compute at all; narrow once we know the working range.
-static const float k_pitch_offset_min = -60.0f;
-static const float k_pitch_offset_max =  60.0f;
+// live in roughly the [0, 30] range. We initially allowed ±60 in S15 to
+// confirm cam[0x30] reaches position compute at all; Alex S44 reported
+// hitting the clamp in normal play (vertical pan stall), so bumped to
+// ±90 to give a full quarter-turn each direction. cam[0x30]'s unit is
+// still empirically unconfirmed (FUN_00799140 reads it through a trig
+// vtable so could be radians or degrees); the DIAGNOSE_PER_FRAME log
+// records cam[0x30]_written each frame so we can narrow further once the
+// unit is nailed down.
+static const float k_pitch_offset_min = -90.0f;
+static const float k_pitch_offset_max =  90.0f;
 
 // --- File-log diagnostics ---
 // Why a file log instead of MessageBox: the wrapper hides the cursor on
@@ -266,19 +328,28 @@ static const float k_pitch_offset_max =  60.0f;
 // (before any cursor hide), so it's still safely clickable.
 static FILE *g_diag_log = nullptr;
 
+// NOTE: no per-call fflush. Calling fflush on every line caused a
+// synchronous disk write per call — and the wrapper runs multiple times per
+// visual frame, so when this fires from the per-frame log it visibly
+// throttles the renderer (Bitdefender scanning the appended bytes makes it
+// worse). The stdio default line/full buffering is fine here. Call
+// diag_flush() at meaningful boundaries (install end, snap-back, post-snap
+// finish) if you want the on-disk file caught up immediately.
 static void diag_logf(const char *fmt, ...) {
   if (!g_diag_log) {
     g_diag_log = fopen("D:\\EQEmu\\Full_RoF2\\lmb_pan_diag.log", "a");
     if (!g_diag_log) return;
     const time_t now = time(nullptr);
     fprintf(g_diag_log, "\n=== Zeal.asi load: %s", ctime(&now));
-    fflush(g_diag_log);
   }
   va_list ap;
   va_start(ap, fmt);
   vfprintf(g_diag_log, fmt, ap);
   va_end(ap);
-  fflush(g_diag_log);
+}
+
+static void diag_flush() {
+  if (g_diag_log) fflush(g_diag_log);
 }
 
 // UI hit-test (Session 15). Returns true when the LMB-down event should NOT
@@ -325,22 +396,38 @@ static bool is_mouse_over_ui_window() {
   void *const mgr =
       *reinterpret_cast<void **>(k_wnd_mgr_global_ghidra + g_aslr_delta);
   if (mgr == nullptr) return false;
-  void *const hovered = *reinterpret_cast<void **>(
-      reinterpret_cast<char *>(mgr) + k_cxwndmgr_hovered_offset);
-  const bool over_ui = (hovered != nullptr);
+  const unsigned *const fields = reinterpret_cast<const unsigned *>(mgr);
+  // Check three transient/cursor-tracking fields, any of which being
+  // non-null means cursor is interacting with UI:
+  //   0x68: transient drag/capture-like (per Session 15 static analysis).
+  //         Slider thumb drags appear to register here while 0x70 stays
+  //         null (Alex S44 follow-up report — Bug #1 STILL fires on
+  //         LOD Bias slider after the per-frame 0x70 re-check fix).
+  //   0x70: Hovered — current cursor's topmost widget (primary signal).
+  //   0x74: tracks 0x70 most of the time; occasional drag-like
+  //         discrepancies (e.g. dragged-thumb still under cursor).
+  //
+  // 0x5C (Focused, sticky) intentionally EXCLUDED — Focused stays set to
+  // whatever window last had keyboard focus (loot, chat input), so checking
+  // it would suppress pan whenever any UI window had recent focus. The
+  // S44 hit-test log confirmed 0x5C was non-null during normal world play.
+  const bool over_ui = (fields[0x68 / 4] != 0) ||
+                       (fields[0x70 / 4] != 0) ||
+                       (fields[0x74 / 4] != 0);
 #if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE
-  // Log first 10 hit-test calls with all four candidate field values so we
-  // can verify 0x70 is still the right choice (vs 0x5C / 0x68 / 0x74) on
-  // re-test. After 10 calls, log goes silent.
+  // Bumped from 10 → 500 in S44 follow-up so a slider-drag test can
+  // capture enough hit-tests to identify which field actually triggers
+  // (if any). Logs every call including ALLOW decisions so Alex can grep
+  // the log around the moment of a slider drag and see what fields look
+  // like vs world-hover.
   static int s_diag_count = 0;
-  if (s_diag_count < 10) {
+  if (s_diag_count < 500) {
     s_diag_count++;
-    const unsigned *p = reinterpret_cast<const unsigned *>(mgr);
     diag_logf("[hit-test #%d] mgr=0x%x  0x5c=%08x 0x64=%08x 0x68=%08x "
               "0x70=%08x 0x74=%08x  decision=%s\n",
               s_diag_count, (unsigned)(uintptr_t)mgr,
-              p[0x5C / 4], p[0x64 / 4], p[0x68 / 4],
-              p[0x70 / 4], p[0x74 / 4],
+              fields[0x5C / 4], fields[0x64 / 4], fields[0x68 / 4],
+              fields[0x70 / 4], fields[0x74 / 4],
               over_ui ? "SUPPRESS" : "ALLOW");
   }
 #endif
@@ -358,15 +445,16 @@ static void enter_panning() {
     g_hides_applied++;
     if (new_count < 0) break;
   }
-  // Multi-monitor safety is handled by the 100px edge-recenter guard in
-  // poll_input (PANNING branch), which warps the cursor back to window center
-  // before it reaches any edge. We deliberately do NOT call ClipCursor here:
-  // EQ's WM_RBUTTONDOWN handler activates camera-turn mode (and likely sets
-  // its own ClipCursor) — if Zeal's clip is already active when that message
-  // arrives, EQ's camera-turn setup fails silently, which prevents the
-  // "both buttons held = move forward" mechanic from firing (the RMB-during-
-  // pan → autorun bug reported after v1.2.1).
-  //
+  // Multi-monitor safety: trap the (hidden) cursor inside the game window
+  // so it can't wander onto a second monitor mid-pan. Released on PANNING
+  // exit (enter_held_keeping_offset / exit_to_idle_snapping_back).
+  {
+    HWND fg = GetForegroundWindow();
+    RECT wr;
+    if (fg && GetWindowRect(fg, &wr)) {
+      ClipCursor(&wr);
+    }
+  }
   // Persistence: do NOT reset g_pitch_offset or g_pitch_snapshotted here.
   // They carry over from any prior HELD state, so re-engaging a pan stacks
   // on top of the previously-held angle. Offsets only reset via RMB
@@ -381,6 +469,7 @@ static void enter_panning() {
 // writes cam[0x30] = g_pitch_base + g_pitch_offset; g_pitch_snapshotted
 // stays true, base stays valid).
 static void enter_held_keeping_offset() {
+  ClipCursor(nullptr);  // release multi-monitor trap from enter_panning()
   SetCursorPos(g_lmb_down_cursor.x, g_lmb_down_cursor.y);
   while (g_hides_applied > 0) {
     ShowCursor(TRUE);
@@ -405,6 +494,26 @@ static void exit_to_idle_snapping_back() {
   diag_logf("[pan-snap-back] RMB triggered; was %s, yaw=%+.3f pitch=%+.3f → 0,0\n",
             from, g_yaw_offset, g_pitch_offset);
 #endif
+  // Release the multi-monitor cursor trap if it was set (only PANNING set it;
+  // HELD already released it). Safe to call even if no clip is active.
+  if (g_state == lmb_state::PANNING) {
+    ClipCursor(nullptr);
+  }
+#if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE
+  // Arm post-snap diagnostic so the next ~90 wrapper frames capture button
+  // state + camera position. Useful for diagnosing the "RMB-during-pan does
+  // not engage EQ's both-buttons-held autorun" bug.
+  //
+  // CRITICAL: no diag_flush() here. This function runs on the renderer/
+  // message-pump thread inside the camera wrapper. A synchronous fflush
+  // here stalls Windows message processing for the duration of the disk
+  // write — EQ's WM_RBUTTONDOWN handler can't run until the flush returns,
+  // and a queue of WM_MOUSEMOVE events piles up. When the renderer
+  // catches up, EQ's RMB-look processes the entire batch in one frame and
+  // the camera spins wildly. Let the OS buffer the writes; the log is
+  // flushed at process exit or when stdio's internal buffer fills.
+  g_post_snap_log_remaining = k_post_snap_log_frames;
+#endif
   if (g_hides_applied > 0) {
     SetCursorPos(g_lmb_down_cursor.x, g_lmb_down_cursor.y);
     while (g_hides_applied > 0) {
@@ -420,15 +529,65 @@ static void exit_to_idle_snapping_back() {
   g_state = lmb_state::IDLE;
 }
 
+// Bug #8 fix (S44 — Alex-confirmed Zeal-induced by without-Zeal test):
+// returns true when the cursor is inside the EQ window rect. Used to gate
+// IDLE→PENDING / HELD→PENDING transitions so a click on the Windows
+// taskbar (or any window outside EQ, while EQ still nominally has
+// foreground focus) does NOT enter our state machine.
+//
+// Without this gate, GetAsyncKeyState(VK_LBUTTON) returns true on a
+// taskbar click (it reads GLOBAL state, not per-window), so the state
+// machine transitions IDLE→PENDING with g_lmb_down_cursor at the
+// taskbar position. If any cursor motion fires the 1-px threshold,
+// PENDING→PANNING runs enter_panning() which calls
+// ClipCursor(EQ_window_rect) — this immediately SNAPS the cursor inside
+// EQ. From the taskbar's perspective: LMB-down at taskbar position,
+// cursor warped upward/leftward (toward EQ window), LMB-up at the new
+// position = a drag gesture. Windows 11 taskbar interprets drag-on-icon
+// as reorder → icon zips to the far-left of the taskbar.
+//
+// The gate is conservative: if GetForegroundWindow() or GetWindowRect()
+// fails (rare), we treat as "not inside EQ" and skip the transition.
+static bool is_cursor_inside_eq_window(POINT *out_cur) {
+  GetCursorPos(out_cur);
+  HWND fg = GetForegroundWindow();
+  RECT wr;
+  return (fg && GetWindowRect(fg, &wr) &&
+          out_cur->x >= wr.left && out_cur->x < wr.right &&
+          out_cur->y >= wr.top && out_cur->y < wr.bottom);
+}
+
 static void poll_input() {
+  const bool has_focus = eq_has_foreground_focus();
+
+#if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE
+  // S44 Bug #2 investigation: log every focus-state transition with full
+  // state context. Helps confirm on an alt-tab cycle whether (a) the
+  // focus-loss demotion to HELD (PANNING path) actually fires, and (b) the
+  // first-RMB-after-regain is being seen by poll_input. If RMB-snap-back
+  // is broken post-regain (bug #2), the log will show whether RMB was
+  // even observed. Pair with the existing [post-snap N] log to capture
+  // the full alt-tab → RMB-snap-back → 90-frame-drift sequence.
+  static bool s_prev_has_focus = true;
+  if (has_focus != s_prev_has_focus) {
+    const char *state_name = (g_state == lmb_state::IDLE)    ? "IDLE"
+                           : (g_state == lmb_state::PENDING) ? "PENDING"
+                           : (g_state == lmb_state::PANNING) ? "PANNING"
+                                                              : "HELD";
+    diag_logf("[focus] EQ -> %s (state=%s yaw=%+.3f pitch=%+.3f hides=%d)\n",
+              has_focus ? "FOREGROUND" : "background",
+              state_name, g_yaw_offset, g_pitch_offset, g_hides_applied);
+    s_prev_has_focus = has_focus;
+  }
+#endif
+
   // Focus gate: if EQ is in the background, do nothing — GetAsyncKeyState
   // reads global key state, so clicks in other apps would otherwise enter
   // our state machine. Also release any lingering ClipCursor so the user's
   // other apps work normally.
-  if (!eq_has_foreground_focus()) {
-    // Safety net: release any cursor clip on background (cheap no-op if none
-    // is active; guards against EQ's own camera-turn ClipCursor lingering
-    // across alt-tab). Zeal itself no longer calls ClipCursor during panning.
+  if (!has_focus) {
+    // Always release ClipCursor on background — cheap idempotent call,
+    // ensures we never leave the clip lingering across alt-tab.
     ClipCursor(nullptr);
     if (g_state == lmb_state::PANNING) {
       // Restore cursor visibility (it was hidden in enter_panning). DON'T
@@ -444,9 +603,24 @@ static void poll_input() {
       g_recenter_pending = false;
       g_state = lmb_state::HELD;
     } else if (g_state == lmb_state::PENDING) {
-      // No pan committed yet — drop back to IDLE so we don't auto-engage
-      // when focus returns.
-      g_state = lmb_state::IDLE;
+      // PENDING dropped on focus loss. If offsets are non-zero, this PENDING
+      // came from a HELD→PENDING re-engagement (user re-pressed LMB while
+      // holding a prior pan-angle) — demote to HELD so the next RMB can snap
+      // back. If offsets are zero, this was a cold IDLE→PENDING (user just
+      // pressed LMB with no prior pan); drop to IDLE and clear g_pitch_
+      // snapshotted so the next pan-enter captures a fresh pitch base.
+      //
+      // Defect A3/B1 fix (S44 — captured live in alt-tab+LMB-down+alt-tab
+      // log capture): the prior unconditional demotion to IDLE while offsets
+      // were non-zero violated the state-machine invariant "IDLE = no
+      // offset", left g_pitch_snapshotted stale, and lost the RMB→snap-back
+      // affordance (RMB→IDLE is a no-op when already IDLE).
+      if (g_yaw_offset == 0.0f && g_pitch_offset == 0.0f) {
+        g_state = lmb_state::IDLE;
+        g_pitch_snapshotted = false;
+      } else {
+        g_state = lmb_state::HELD;
+      }
     }
     return;
   }
@@ -454,11 +628,42 @@ static void poll_input() {
   const bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
   const bool rmb = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
 
+  // Bug B2 (S44): read the active camera mode index. Used to:
+  //   (a) Detect mode-switch (F9 cycle, scroll-to-1st-person) mid-PANNING
+  //       and clean up cursor state — without this, ShowCursor stays
+  //       decremented + ClipCursor stays set + state stays PANNING until
+  //       user gets back to mode 6 AND presses RMB.
+  //   (b) Gate IDLE→PENDING and HELD→PENDING transitions to mode 6 only.
+  //       Pan-engagement from other modes doesn't make sense (mode_6_wrapper
+  //       isn't firing to apply offsets to cam state) and would just
+  //       accumulate invisible yaw/pitch.
+  const int active_mode = *reinterpret_cast<int *>(
+      k_dat_active_mode_ghidra + g_aslr_delta);
+  if (active_mode != 6 && g_state == lmb_state::PANNING) {
+    ClipCursor(nullptr);
+    while (g_hides_applied > 0) {
+      ShowCursor(TRUE);
+      g_hides_applied--;
+    }
+    g_recenter_pending = false;
+    g_state = lmb_state::HELD;
+#if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE
+    diag_logf("[mode-switch] active_mode=%d != 6 → demoted PANNING to HELD "
+              "(offsets persist: yaw=%+.3f pitch=%+.3f)\n",
+              active_mode, g_yaw_offset, g_pitch_offset);
+#endif
+  }
+
   switch (g_state) {
     case lmb_state::IDLE:
-      if (lmb && !rmb && !is_mouse_over_ui_window()) {
-        GetCursorPos(&g_lmb_down_cursor);
-        g_state = lmb_state::PENDING;
+      // Bug B2 gate: pan engagement only from mode 6.
+      if (active_mode == 6 && lmb && !rmb && !is_mouse_over_ui_window()) {
+        // Bug #8 gate — see is_cursor_inside_eq_window() comment.
+        POINT cur;
+        if (is_cursor_inside_eq_window(&cur)) {
+          g_lmb_down_cursor = cur;
+          g_state = lmb_state::PENDING;
+        }
       }
       break;
     case lmb_state::PENDING:
@@ -498,6 +703,17 @@ static void poll_input() {
       } else if (!lmb) {
         enter_held_keeping_offset();
       } else {
+        // NOTE — Bug B3 first-cut REVERTED. The initial fix re-called
+        // is_mouse_over_ui_window() per frame during PANNING and demoted
+        // to HELD when cursor drifted over a UI window. Alex S44 follow-
+        // up report: that introduced a regression where mid-pan cursor
+        // drift over any UI element (chat, hotbutton bar, etc.) kicked
+        // out of pan unexpectedly — disorienting because the cursor is
+        // hidden during PANNING so user can't see/control where it
+        // goes. The IDLE→PENDING and HELD→PENDING widened hit-test
+        // (0x68|0x70|0x74) catches slider clicks at the right moment
+        // (entry), making this per-frame re-check redundant insurance
+        // with worse downside than the risk it covered. Removed.
         POINT current;
         GetCursorPos(&current);
 
@@ -569,13 +785,20 @@ static void poll_input() {
     case lmb_state::HELD:
       if (rmb) {
         // RMB while a pan is held: instant snap-back per spec.
+        // Note: snap-back is mode-AGNOSTIC — user can snap back held
+        // offsets even from a different camera mode they switched into.
         exit_to_idle_snapping_back();
-      } else if (lmb && !is_mouse_over_ui_window()) {
+      } else if (active_mode == 6 && lmb && !is_mouse_over_ui_window()) {
         // LMB pressed from HELD: re-engage. Offsets persist (we DON'T reset
         // them here or in enter_panning); further drag stacks on the held
         // angle.
-        GetCursorPos(&g_lmb_down_cursor);
-        g_state = lmb_state::PENDING;
+        // Bug B2 gate: pan re-engagement only from mode 6.
+        // Bug #8 gate: taskbar click while HELD shouldn't re-engage pan.
+        POINT cur;
+        if (is_cursor_inside_eq_window(&cur)) {
+          g_lmb_down_cursor = cur;
+          g_state = lmb_state::PENDING;
+        }
       }
       // else: stay in HELD (cursor visible, offsets persistent, pitch
       // continues being applied each frame via the wrapper's PANNING/HELD
@@ -584,10 +807,70 @@ static void poll_input() {
   }
 }
 
+// Per-mode poll-and-chain wrappers (Bug B2 fix). Each fires per render
+// frame while its mode is active. They do NOTHING with cam state — just
+// call poll_input() so the state machine can see input + transition
+// (particularly the PANNING-to-HELD demote on mode-switch when active
+// mode != 6), then chain to the per-mode original anchor compute.
+// Mode 6 has its own dedicated wrapper below that does the full
+// yaw/pitch cam-write work; these are the lightweight siblings.
+static void __fastcall mode_0_wrapper(void *cam, int /*edx*/, int *entity) {
+  poll_input();
+  if (g_original_mode_0) g_original_mode_0(cam, 0, entity);
+}
+static void __fastcall mode_1_wrapper(void *cam, int /*edx*/, int *entity) {
+  poll_input();
+  if (g_original_mode_1) g_original_mode_1(cam, 0, entity);
+}
+static void __fastcall mode_2_wrapper(void *cam, int /*edx*/, int *entity) {
+  poll_input();
+  if (g_original_mode_2) g_original_mode_2(cam, 0, entity);
+}
+static void __fastcall mode_3_4_7_wrapper(void *cam, int /*edx*/, int *entity) {
+  poll_input();
+  if (g_original_mode_3_4_7) g_original_mode_3_4_7(cam, 0, entity);
+}
+static void __fastcall mode_5_wrapper(void *cam, int /*edx*/, int *entity) {
+  poll_input();
+  if (g_original_mode_5) g_original_mode_5(cam, 0, entity);
+}
+static void __fastcall mode_8_wrapper(void *cam, int /*edx*/, int *entity) {
+  poll_input();
+  if (g_original_mode_8) g_original_mode_8(cam, 0, entity);
+}
+
 static void __fastcall mode_6_wrapper(void *cam, int /*edx_unused*/, int *entity) {
   poll_input();
 
   char *const cam_bytes = reinterpret_cast<char *>(cam);
+
+#if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE
+  // Post-snap-back diagnostic. Logs button state + camera position for the
+  // first k_post_snap_log_frames frames after each RMB-triggered snap-back.
+  // If EQ's "both buttons = autorun" engaged, cam position will drift forward
+  // across these frames (because the player is actually moving). If it
+  // didn't engage, position will be steady. We also log lmb/rmb raw bits so
+  // we can confirm Windows still reports both as physically held.
+  if (g_post_snap_log_remaining > 0) {
+    const int frame_idx = k_post_snap_log_frames - g_post_snap_log_remaining;
+    const bool lmb_now = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    const bool rmb_now = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    const float px = *reinterpret_cast<float *>(cam_bytes + k_cam_pos_x_offset);
+    const float py = *reinterpret_cast<float *>(cam_bytes + k_cam_pos_y_offset);
+    const float pz = *reinterpret_cast<float *>(cam_bytes + k_cam_pos_z_offset);
+    const char *state_name = (g_state == lmb_state::IDLE)    ? "IDLE"
+                           : (g_state == lmb_state::PENDING) ? "PENDING"
+                           : (g_state == lmb_state::PANNING) ? "PANNING"
+                                                              : "HELD";
+    diag_logf("[post-snap %3d] state=%s lmb=%d rmb=%d  "
+              "cam=(%.3f, %.3f, %.3f)\n",
+              frame_idx, state_name, lmb_now ? 1 : 0, rmb_now ? 1 : 0,
+              px, py, pz);
+    g_post_snap_log_remaining--;
+    // Intentionally no diag_flush here — same renderer-thread-stall reason
+    // as in exit_to_idle_snapping_back. Rely on stdio buffer flush at exit.
+  }
+#endif
 
   // PITCH state machine (Session 15, "Approach A", revised r2 for persistence):
   //   On first PANNING frame:   snapshot cam[0x30] → g_pitch_base.
@@ -641,7 +924,7 @@ static void __fastcall mode_6_wrapper(void *cam, int /*edx_unused*/, int *entity
   // Pre-original capture for the per-frame pitch diagnostic. Captures the
   // first k_max_pan_frames_to_log PANNING frames of every pan; counter resets
   // when the pan ends so each pan starts fresh.
-#if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE
+#if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE_PER_FRAME
   static int s_pan_frame_log_count = 0;
   static const int k_max_pan_frames_to_log = 200;
   float diag_pre_x = 0.0f, diag_pre_y = 0.0f, diag_pre_z = 0.0f;
@@ -681,7 +964,7 @@ static void __fastcall mode_6_wrapper(void *cam, int /*edx_unused*/, int *entity
     *dat_703_ptr = saved_dat_703;
   }
 
-#if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE
+#if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE_PER_FRAME
   if (diag_log_this_frame) {
     const float post_x = *reinterpret_cast<float *>(cam_bytes + k_cam_pos_x_offset);
     const float post_y = *reinterpret_cast<float *>(cam_bytes + k_cam_pos_y_offset);
@@ -708,6 +991,40 @@ static void __fastcall mode_6_wrapper(void *cam, int /*edx_unused*/, int *entity
     s_pan_frame_log_count = 0;
   }
 #endif
+}
+
+// Bug B2 helper (S44): install a non-mode-6 vtable slot 0x08 wrapper.
+// Returns true on success, false on signature mismatch (silently skipped —
+// mismatch on a single non-mode-6 mode means PANNING leak will persist on
+// THAT mode-switch but not catastrophic; mode-6 install is the only
+// must-succeed slot). Logs install/skip decision when DIAGNOSE is on.
+static bool install_aux_mode_wrapper(uintptr_t slot_ghidra,
+                                     uintptr_t expected_original_ghidra,
+                                     void *new_fn,
+                                     slot_08_fn *out_original,
+                                     uintptr_t aslr_delta,
+                                     const char *mode_label) {
+  const uintptr_t slot_runtime = slot_ghidra + aslr_delta;
+  const uintptr_t expected_runtime = expected_original_ghidra + aslr_delta;
+  uintptr_t *const slot_ptr = reinterpret_cast<uintptr_t *>(slot_runtime);
+  const uintptr_t actual = *slot_ptr;
+  const bool match = (actual == expected_runtime);
+#if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE
+  diag_logf("[install-aux] mode=%s slot=0x%08x expected=0x%08x actual=0x%08x "
+            "match=%s decision=%s\n",
+            mode_label,
+            (unsigned)slot_runtime, (unsigned)expected_runtime,
+            (unsigned)actual,
+            match ? "YES" : "NO", match ? "INSTALL" : "SKIP");
+#endif
+  if (!match) return false;
+  *out_original = reinterpret_cast<slot_08_fn>(actual);
+  DWORD old_protect;
+  VirtualProtect(slot_ptr, sizeof(uintptr_t), PAGE_READWRITE, &old_protect);
+  *slot_ptr = reinterpret_cast<uintptr_t>(new_fn);
+  VirtualProtect(slot_ptr, sizeof(uintptr_t), old_protect, &old_protect);
+  FlushInstructionCache(GetCurrentProcess(), slot_ptr, sizeof(uintptr_t));
+  return true;
 }
 
 bool install(uintptr_t aslr_delta) {
@@ -746,6 +1063,7 @@ bool install(uintptr_t aslr_delta) {
             match ? "YES" : "NO", match ? "INSTALL" : "SKIP (silent no-op)");
   MessageBoxA(NULL, msg, "Zeal-RoF2 R3 / LMB-pan install diagnostic",
               MB_OK | MB_ICONINFORMATION);
+  diag_flush();
 #endif
 
   if (!match) return false;
@@ -757,6 +1075,39 @@ bool install(uintptr_t aslr_delta) {
   *slot_ptr = reinterpret_cast<uintptr_t>(&mode_6_wrapper);
   VirtualProtect(slot_ptr, sizeof(uintptr_t), old_protect, &old_protect);
   FlushInstructionCache(GetCurrentProcess(), slot_ptr, sizeof(uintptr_t));
+
+  // Bug B2 fix (S44): install poll-and-chain wrappers on every other
+  // camera mode's vtable slot 0x08 too, so the state machine ticks even
+  // when active mode != 6. Each individual install is non-fatal on
+  // signature mismatch (only mode-6 is required). Worst case = PANNING
+  // leak persists on that one specific mode-switch direction.
+  install_aux_mode_wrapper(k_mode_0_vtable_slot_08_ghidra,
+                           k_mode_0_slot_08_original_ghidra,
+                           &mode_0_wrapper, &g_original_mode_0,
+                           aslr_delta, "0 (1st-person)");
+  install_aux_mode_wrapper(k_mode_1_vtable_slot_08_ghidra,
+                           k_mode_1_slot_08_original_ghidra,
+                           &mode_1_wrapper, &g_original_mode_1,
+                           aslr_delta, "1 (F9 alt)");
+  install_aux_mode_wrapper(k_mode_2_vtable_slot_08_ghidra,
+                           k_mode_2_slot_08_original_ghidra,
+                           &mode_2_wrapper, &g_original_mode_2,
+                           aslr_delta, "2 (F9 alt)");
+  install_aux_mode_wrapper(k_mode_3_4_7_vtable_slot_08_ghidra,
+                           k_mode_3_4_7_slot_08_original_ghidra,
+                           &mode_3_4_7_wrapper, &g_original_mode_3_4_7,
+                           aslr_delta, "3/4/7 (shared)");
+  install_aux_mode_wrapper(k_mode_5_vtable_slot_08_ghidra,
+                           k_mode_5_slot_08_original_ghidra,
+                           &mode_5_wrapper, &g_original_mode_5,
+                           aslr_delta, "5");
+  install_aux_mode_wrapper(k_mode_8_vtable_slot_08_ghidra,
+                           k_mode_8_slot_08_original_ghidra,
+                           &mode_8_wrapper, &g_original_mode_8,
+                           aslr_delta, "8");
+#if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE
+  diag_flush();
+#endif
 
   return true;
 }
