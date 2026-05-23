@@ -473,6 +473,34 @@ static void exit_to_idle_snapping_back() {
   g_state = lmb_state::IDLE;
 }
 
+// Bug #8 fix (S44 — Alex-confirmed Zeal-induced by without-Zeal test):
+// returns true when the cursor is inside the EQ window rect. Used to gate
+// IDLE→PENDING / HELD→PENDING transitions so a click on the Windows
+// taskbar (or any window outside EQ, while EQ still nominally has
+// foreground focus) does NOT enter our state machine.
+//
+// Without this gate, GetAsyncKeyState(VK_LBUTTON) returns true on a
+// taskbar click (it reads GLOBAL state, not per-window), so the state
+// machine transitions IDLE→PENDING with g_lmb_down_cursor at the
+// taskbar position. If any cursor motion fires the 1-px threshold,
+// PENDING→PANNING runs enter_panning() which calls
+// ClipCursor(EQ_window_rect) — this immediately SNAPS the cursor inside
+// EQ. From the taskbar's perspective: LMB-down at taskbar position,
+// cursor warped upward/leftward (toward EQ window), LMB-up at the new
+// position = a drag gesture. Windows 11 taskbar interprets drag-on-icon
+// as reorder → icon zips to the far-left of the taskbar.
+//
+// The gate is conservative: if GetForegroundWindow() or GetWindowRect()
+// fails (rare), we treat as "not inside EQ" and skip the transition.
+static bool is_cursor_inside_eq_window(POINT *out_cur) {
+  GetCursorPos(out_cur);
+  HWND fg = GetForegroundWindow();
+  RECT wr;
+  return (fg && GetWindowRect(fg, &wr) &&
+          out_cur->x >= wr.left && out_cur->x < wr.right &&
+          out_cur->y >= wr.top && out_cur->y < wr.bottom);
+}
+
 static void poll_input() {
   const bool has_focus = eq_has_foreground_focus();
 
@@ -547,8 +575,12 @@ static void poll_input() {
   switch (g_state) {
     case lmb_state::IDLE:
       if (lmb && !rmb && !is_mouse_over_ui_window()) {
-        GetCursorPos(&g_lmb_down_cursor);
-        g_state = lmb_state::PENDING;
+        // Bug #8 gate — see is_cursor_inside_eq_window() comment.
+        POINT cur;
+        if (is_cursor_inside_eq_window(&cur)) {
+          g_lmb_down_cursor = cur;
+          g_state = lmb_state::PENDING;
+        }
       }
       break;
     case lmb_state::PENDING:
@@ -664,8 +696,12 @@ static void poll_input() {
         // LMB pressed from HELD: re-engage. Offsets persist (we DON'T reset
         // them here or in enter_panning); further drag stacks on the held
         // angle.
-        GetCursorPos(&g_lmb_down_cursor);
-        g_state = lmb_state::PENDING;
+        // Bug #8 gate — taskbar click while HELD shouldn't re-engage pan.
+        POINT cur;
+        if (is_cursor_inside_eq_window(&cur)) {
+          g_lmb_down_cursor = cur;
+          g_state = lmb_state::PENDING;
+        }
       }
       // else: stay in HELD (cursor visible, offsets persistent, pitch
       // continues being applied each frame via the wrapper's PANNING/HELD
