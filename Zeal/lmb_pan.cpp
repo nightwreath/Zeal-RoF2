@@ -702,28 +702,18 @@ static void poll_input() {
         exit_to_idle_snapping_back();
       } else if (!lmb) {
         enter_held_keeping_offset();
-      } else if (is_mouse_over_ui_window()) {
-        // Bug B3 fix (S44): cursor moved over a UI window mid-pan.
-        // Without this check, the pan continues to accumulate yaw/pitch
-        // while EQ engine drags whatever UI element is under the cursor
-        // (sliders specifically — Bug #1 root cause). Release our cursor
-        // controls and demote to HELD so EQ can handle the UI interaction.
-        // Do NOT SetCursorPos — user's cursor is already on the UI
-        // element where they want to interact. Offsets persist; RMB still
-        // snaps back from HELD if desired.
-        ClipCursor(nullptr);
-        while (g_hides_applied > 0) {
-          ShowCursor(TRUE);
-          g_hides_applied--;
-        }
-        g_recenter_pending = false;
-        g_state = lmb_state::HELD;
-#if ZEAL_ROF2_R3_LMB_PAN_DIAGNOSE
-        diag_logf("[pan-exit-ui] cursor over UI mid-pan; demoted to HELD "
-                  "(yaw=%+.3f pitch=%+.3f)\n",
-                  g_yaw_offset, g_pitch_offset);
-#endif
       } else {
+        // NOTE — Bug B3 first-cut REVERTED. The initial fix re-called
+        // is_mouse_over_ui_window() per frame during PANNING and demoted
+        // to HELD when cursor drifted over a UI window. Alex S44 follow-
+        // up report: that introduced a regression where mid-pan cursor
+        // drift over any UI element (chat, hotbutton bar, etc.) kicked
+        // out of pan unexpectedly — disorienting because the cursor is
+        // hidden during PANNING so user can't see/control where it
+        // goes. The IDLE→PENDING and HELD→PENDING widened hit-test
+        // (0x68|0x70|0x74) catches slider clicks at the right moment
+        // (entry), making this per-frame re-check redundant insurance
+        // with worse downside than the risk it covered. Removed.
         POINT current;
         GetCursorPos(&current);
 
