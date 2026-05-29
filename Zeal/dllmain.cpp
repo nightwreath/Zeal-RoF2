@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "lmb_pan.h"
+#include "swim_controls.h"
 #include "zeal.h"
 
 // Layer 0 addresses ported from 2002 client to RoF2 (Session 9 Ghidra work,
@@ -63,6 +64,13 @@ static const int load_options_call_jump_value_unpatched = 0x0000e9c1;
 // LMB-no-RMB input poll + state machine + snap-back lerp that drives the
 // offset. See PHASE1_CAMERA.md.
 #define ZEAL_ROF2_R3_LMB_PAN 1
+
+// R3 Stage 3: hold-to-swim. Session 52. Two detours — ExecuteCmd
+// (FUN_004D7230) tracks JUMP (cmd 1) and CMD_MOVE_DOWN (cmd 449) held
+// state, per-frame tick (FUN_0052BBD0) re-fires the cmd every 120ms while
+// held + in water (SwimmingFeetTouchingWater == 5, water type != lava).
+// See swim_controls.cpp header for full mechanism notes.
+#define ZEAL_ROF2_SWIM_CONTROLS 1
 
 // Our replacement constant. The linker places this in Zeal.asi's writable
 // data segment (the const-ness is dropped so handle_process_attach can write
@@ -233,6 +241,13 @@ static void handle_process_attach() {
   // R3 Stage 2 MVP: patch chase camera vtable slot 0x08. Signature-gated
   // inside lmb_pan::install — silently no-ops on mismatch.
   lmb_pan::install(aslr_delta);
+#endif
+
+#if ZEAL_ROF2_SWIM_CONTROLS
+  // R3 Stage 3: install ExecuteCmd + per-frame-tick detours that drive
+  // hold-to-swim. Returns false on hook failure; we ignore the result so
+  // other features still run if this one fails to install.
+  swim_controls::install(aslr_delta);
 #endif
 }
 

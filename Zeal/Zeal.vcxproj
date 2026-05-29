@@ -133,6 +133,7 @@
     <ClInclude Include="memory.h" />
     <ClInclude Include="camera_mods.h" />
     <ClInclude Include="lmb_pan.h" />
+    <ClInclude Include="swim_controls.h" />
     <ClInclude Include="instruction_length.h" />
     <ClInclude Include="netstat.h" />
     <ClInclude Include="outputfile.h" />
@@ -214,6 +215,7 @@
     <ClCompile Include="memory.cpp" />
     <ClCompile Include="camera_mods.cpp" />
     <ClCompile Include="lmb_pan.cpp" />
+    <ClCompile Include="swim_controls.cpp" />
     <ClCompile Include="netstat.cpp" />
     <ClCompile Include="outputfile.cpp" />
     <ClCompile Include="raid.cpp" />
