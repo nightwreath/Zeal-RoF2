@@ -54,10 +54,13 @@ constexpr int kSocialColorOff = 0x510;  // 1 byte
 constexpr int kSocialDirtyStride = 0x0C;
 constexpr uint8_t kSocialColor = 0;  // matches launcher-managed buttons (Color=0)
 
-// Candidate social PAGES (0-based). Page 0 (in-game "Page 1") is the player's
-// always-visible page; pages 7-9 ("Page 8-10") are overflow. Launcher pages
-// 1-6 are skipped (the launcher prunes them).
-constexpr int kCandidatePages[] = {0, 7, 8, 9};
+// Candidate social PAGES (0-based), in fill order (Alex-locked S57). Dedicate
+// the free overflow pages 7-9 (in-game "Page 8-10") to auto-created cast
+// buttons so they stay grouped and OFF the player's personal Page 1; page 0
+// (in-game "Page 1") is the last-resort fallback once 8-10 fill (~36 slots).
+// Launcher-managed pages 1-6 (in-game "Page 2-7": bot command + create
+// buttons) are never touched.
+constexpr int kCandidatePages[] = {7, 8, 9, 0};
 
 uintptr_t g_aslr_delta = 0;
 hook *g_dsp_hook = nullptr;
