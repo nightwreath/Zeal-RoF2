@@ -87,7 +87,6 @@ class ZealService {
   std::unique_ptr<class CharacterSelect> charselect = nullptr;
   std::unique_ptr<class SpellSets> spell_sets = nullptr;
   std::unique_ptr<class Bandolier> bandolier = nullptr;
-  std::unique_ptr<class BotCastButton> bot_cast_button = nullptr;
   std::unique_ptr<class Survey> survey = nullptr;
 
   std::unique_ptr<class NamedPipe> pipe = nullptr;

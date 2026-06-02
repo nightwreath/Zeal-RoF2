@@ -1,102 +1,93 @@
+#define _CRT_SECURE_NO_WARNINGS
+
 #include "bot_cast_button.h"
 
 #include <Windows.h>
 
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
-#include <vector>
 
-#include "callbacks.h"
-#include "commands.h"
-#include "game_addresses.h"
-#include "game_functions.h"
-#include "game_structures.h"
-#include "game_ui.h"
+#include "hook_wrapper.h"  // standalone `hook` class (detour) -- no ZealService needed
 #include "memory.h"
-#include "zeal.h"
 
-// Ship the diagnostic with v1 (feedback_diagnostics_from_v1.md). Flip to 0
-// once the feature is verified stable in-game. When 1, every saylink click is
-// logged with its full augment payload so the wire format (and a wrong
-// social-store address) surfaces in a single launch.
+// Ship the diagnostic with v1 (feedback_diagnostics_from_v1.md). When 1,
+// install() writes D:\EQEmu\Full_RoF2\acb_diag.txt (delta + signature match +
+// dsp_chat runtime address) and the first caught signal line is echoed, so a
+// wrong address / non-install surfaces in a single launch. Flip to 0 once
+// verified stable in-game.
 #define BOT_CAST_BUTTON_DIAGNOSE 1
+
+namespace bot_cast_button {
 
 namespace {
 
-// ---- Wire / engine-agreed constants (MUST match theo-and-co-engine) ----
-constexpr unsigned int kOpItemLinkClick = 0x4cef;   // RoF2 client->server (utils/patches/patch_RoF2.conf:262)
-constexpr uint32_t kSaylinkItemId = 0xFFFFF;        // common/features.h SAYLINK_ITEM_ID
-constexpr uint32_t kAddCastMarker = 0xADDCA;        // bot.cpp ListBotSpells augments[4]
+// ---- dsp_chat (client chat-display), Ghidra-derived vs OUR eqgame.exe (S57).
+//   void __stdcall dsp_chat(const char* text, int color, int p3, int add_log)
+//   359 callers; ends RET 0x10 (callee cleans 4 dword args -> __stdcall).
+//   Prologue: 64 A1 00 00 00 00  (mov eax, fs:[0]) -- position-independent, so
+//   the same bytes appear at runtime regardless of ASLR -> a stable guard. ----
+constexpr uintptr_t kDspChatGhidra = 0x0051F1A0;
+const unsigned char kDspChatSig[6] = {0x64, 0xA1, 0x00, 0x00, 0x00, 0x00};
+using dsp_chat_fn = void(__stdcall *)(const char *text, int color, int p3, int add_log);
 
-// ---- Social store (Ghidra-derived vs our eqgame.exe, S55). These are static
+// ---- Engine-agreed signal line (theo-and-co-engine client_packet.cpp, S57).
+//   "Bot cast button ready: [<CLS>] <SpellName> via <BotName> (id <spellid>)"
+// Must stay byte-identical with the engine's Message() format string prefix. ----
+constexpr char kSignalPrefix[] = "Bot cast button ready: [";
+constexpr char kViaSep[] = " via ";
+constexpr char kIdSep[] = " (id ";
+
+// ---- Social store (Ghidra-derived vs our eqgame.exe, S55). Static
 //      (preferred-base 0x400000) addresses; add the runtime ASLR delta. ----
 constexpr uintptr_t kSocialRecordsBase = 0x00E15F10;
 constexpr uintptr_t kSocialDirtyBase = 0x00E15E98;
 constexpr int kSocialButtons = 12;
 constexpr int kSocialPageStride = 0x3D50;
 constexpr int kSocialRecStride = 0x51C;
-constexpr int kSocialNameOff = 0x000;    // 16 bytes (15 chars + null)
-constexpr int kSocialLine1Off = 0x010;   // 256 bytes
-constexpr int kSocialColorOff = 0x510;   // 1 byte
-constexpr int kSocialDirtyStride = 0x0C;  // per page; + button index
-constexpr uint8_t kSocialColor = 0;       // matches Launch_EQ.ps1 managed buttons (Color=0)
+constexpr int kSocialNameOff = 0x000;   // 16 bytes (15 chars + null)
+constexpr int kSocialLine1Off = 0x010;  // 256 bytes
+constexpr int kSocialColorOff = 0x510;  // 1 byte
+constexpr int kSocialDirtyStride = 0x0C;
+constexpr uint8_t kSocialColor = 0;  // matches launcher-managed buttons (Color=0)
 
-// Candidate social PAGES (0-based) for new cast-buttons, in priority order.
-// Page 0 (the in-game "Page 1") is the player's page -- always visible and
-// never touched by the launcher, so the drag-to-bar MVP is verifiable there.
-// Pages 7-9 ("Page 8-10") are dedicated overflow. Launcher pages 1-6
-// ("Page 2-7") are deliberately skipped -- the launcher prunes them.
+// Candidate social PAGES (0-based). Page 0 (in-game "Page 1") is the player's
+// always-visible page; pages 7-9 ("Page 8-10") are overflow. Launcher pages
+// 1-6 are skipped (the launcher prunes them).
 constexpr int kCandidatePages[] = {0, 7, 8, 9};
 
-// EQ client->server item-link-click payload (engine ItemViewRequest_Struct, 52 bytes).
-#pragma pack(push, 1)
-struct ItemViewRequest {
-  uint32_t item_id;         // 0x00
-  uint32_t augments[6];     // 0x04
-  uint32_t link_hash;       // 0x1C
-  uint32_t unknown028;      // 0x20
-  char unknown032[12];      // 0x24
-  uint16_t icon;            // 0x30
-  char unknown046[2];       // 0x32
-};                          // 0x34 (52)
-#pragma pack(pop)
-static_assert(sizeof(ItemViewRequest) == 52, "ItemViewRequest must be 52 bytes");
+uintptr_t g_aslr_delta = 0;
+hook *g_dsp_hook = nullptr;
 
-const char *class_code(int class_id) {
-  switch (class_id) {
-    case 1: return "WAR";
-    case 2: return "CLR";
-    case 3: return "PAL";
-    case 4: return "RNG";
-    case 5: return "SHD";
-    case 6: return "DRU";
-    case 7: return "MNK";
-    case 8: return "BRD";
-    case 9: return "ROG";
-    case 10: return "SHM";
-    case 11: return "NEC";
-    case 12: return "WIZ";
-    case 13: return "MAG";
-    case 14: return "ENC";
-    case 15: return "BST";
-    default: return "BOT";
-  }
+#if BOT_CAST_BUTTON_DIAGNOSE
+bool g_logged_first_catch = false;
+void diag_file(const char *fmt, ...) {
+  FILE *f = nullptr;
+  fopen_s(&f, "D:/EQEmu/Full_RoF2/acb_diag.txt", "a");
+  if (!f) return;
+  va_list ap;
+  va_start(ap, fmt);
+  std::vfprintf(f, fmt, ap);
+  va_end(ap);
+  std::fclose(f);
 }
+#endif
 
-}  // namespace
-
-int BotCastButton::create_social(const char *label, const char *command_line) {
+// Writes a one-line social into the first free candidate slot. Returns a
+// 0-based (page*12 + button) index, or -1 if all candidate slots are full.
+int create_social(const char *label, const char *command_line) {
   for (int page : kCandidatePages) {
     for (int b = 0; b < kSocialButtons; ++b) {
       const uintptr_t rec =
-          kSocialRecordsBase + aslr_delta_ + page * kSocialPageStride + b * kSocialRecStride;
+          kSocialRecordsBase + g_aslr_delta + page * kSocialPageStride + b * kSocialRecStride;
       const char *existing = reinterpret_cast<const char *>(rec + kSocialNameOff);
       if (existing[0] != '\0') continue;  // slot occupied
 
-      // Clear the whole record first so a previously-deleted slot can't leave
-      // stale Line2-5 commands attached to our one-line social.
+      // Clear the whole record so a previously-deleted slot can't leave stale
+      // Line2-5 commands attached to our one-line social.
       mem::set(static_cast<int>(rec), 0, kSocialRecStride);
 
       char namebuf[16] = {0};
@@ -113,8 +104,7 @@ int BotCastButton::create_social(const char *label, const char *command_line) {
 
       mem::write<uint8_t>(static_cast<int>(rec + kSocialColorOff), kSocialColor);
 
-      const uintptr_t dirty =
-          kSocialDirtyBase + aslr_delta_ + page * kSocialDirtyStride + b;
+      const uintptr_t dirty = kSocialDirtyBase + g_aslr_delta + page * kSocialDirtyStride + b;
       mem::write<uint8_t>(static_cast<int>(dirty), 1);
 
       return page * kSocialButtons + b;
@@ -123,135 +113,109 @@ int BotCastButton::create_social(const char *label, const char *command_line) {
   return -1;
 }
 
-bool BotCastButton::handle_outgoing_packet(unsigned int opcode, char *buffer, unsigned int len) {
-#if BOT_CAST_BUTTON_DIAGNOSE
-  // One-shot: confirms the SendMessage hook actually fires on our binary (if
-  // this never appears, the hook address 0x54e51a is wrong at runtime or the
-  // item-link-click takes a different send path).
-  static bool announced = false;
-  if (!announced) {
-    announced = true;
-    Zeal::Game::print_chat(USERCOLOR_SPELLS, "[ACB] tx-hook LIVE (first packet seen).");
-  }
-  // Low-noise: only log packets the size of an item-link-click (52) or the
-  // expected opcode, so the [Add Button] click stands out.
-  if (len == sizeof(ItemViewRequest) || opcode == kOpItemLinkClick) {
-    Zeal::Game::print_chat("[ACB tx] op=0x%X len=%u first4=0x%08X", opcode, len,
-                           (len >= 4 && buffer) ? *reinterpret_cast<unsigned int *>(buffer) : 0u);
-  }
-#endif
-  if (opcode != kOpItemLinkClick || len != sizeof(ItemViewRequest) || !buffer) return false;
-  auto *ivr = reinterpret_cast<ItemViewRequest *>(buffer);
-  if (ivr->item_id != kSaylinkItemId) return false;  // not a saylink-format link
+// Parses the engine signal line and builds the social. Returns true if `text`
+// was our signal (caller suppresses the raw line + shows a clean confirmation).
+bool handle_signal_line(const char *text, int color, int p3, int add_log) {
+  if (!text) return false;
+  const size_t plen = sizeof(kSignalPrefix) - 1;
+  if (std::strncmp(text, kSignalPrefix, plen) != 0) return false;  // not our line
 
 #if BOT_CAST_BUTTON_DIAGNOSE
-  Zeal::Game::print_chat(
-      "[AddButton diag] saylink click aug=[%u,%u,%u,%u,%u,%u] hash=0x%X delta=0x%X",
-      ivr->augments[0], ivr->augments[1], ivr->augments[2], ivr->augments[3], ivr->augments[4],
-      ivr->augments[5], ivr->link_hash, static_cast<unsigned int>(aslr_delta_));
-#endif
-
-  if (ivr->augments[4] != kAddCastMarker) return false;  // a normal saylink -> let it reach the server
-
-  // Our [Add Button] click. Decode -> build the social -> suppress the packet.
-  const uint16_t spell_id = static_cast<uint16_t>(ivr->augments[2]);
-  const uint16_t bot_id = static_cast<uint16_t>(ivr->augments[3]);
-
-#if BOT_CAST_BUTTON_DIAGNOSE
-  // Cursor-attach feasibility probe (S56). ChatManager is the control: chat
-  // works, so it must be a sane pointer. If CursorAttachment is a similar
-  // (non-null, heap-range) pointer, Windows->CursorAttachment resolves on our
-  // binary and the deluxe cursor-attach needs only the attach FUNCTION. Reading
-  // the table slots is safe; we do NOT dereference the result here.
-  if (Zeal::Game::Windows) {
-    Zeal::Game::print_chat("[AddButton diag] Windows=0x%X ChatMgr=0x%X CursorAttach=0x%X",
-                           reinterpret_cast<uintptr_t>(Zeal::Game::Windows),
-                           reinterpret_cast<uintptr_t>(Zeal::Game::Windows->ChatManager),
-                           reinterpret_cast<uintptr_t>(Zeal::Game::Windows->CursorAttachment));
+  if (!g_logged_first_catch) {
+    g_logged_first_catch = true;
+    diag_file("first signal caught: \"%s\"\n", text);
   }
 #endif
 
-  Zeal::GameStructures::Entity *bot = Zeal::Game::get_entity_by_id(static_cast<short>(bot_id));
-  if (!bot) {
-    Zeal::Game::print_chat(
-        USERCOLOR_SHOUT,
-        "[Add Button] That bot is no longer in the zone -- reopen its spell list (^spells) and try again.");
-    return true;
-  }
+  std::string s(text);
+  // "Bot cast button ready: [<CLS>] <SpellName> via <BotName> (id <spellid>)"
+  const size_t cls_beg = plen;  // first char after the '['
+  const size_t cls_end = s.find(']', cls_beg);
+  if (cls_end == std::string::npos) return false;
+  const std::string cls = s.substr(cls_beg, cls_end - cls_beg);
 
-  const auto *spell_mgr = Zeal::Game::get_spell_mgr();
-  const auto *spell =
-      (spell_mgr && Zeal::Game::Spells::IsValidSpellIndex(spell_id)) ? spell_mgr->Spells[spell_id] : nullptr;
-  const char *spell_name = (spell && spell->Name) ? spell->Name : "Spell";
+  size_t name_beg = cls_end + 1;
+  if (name_beg < s.size() && s[name_beg] == ' ') ++name_beg;  // skip "] "
 
-  // Label: "<CLS> <SpellName>", ALL-CAPS class code, hard-truncated to 15.
-  std::string label = class_code(bot->Class);
-  label += ' ';
-  label += spell_name;
+  const size_t via = s.find(kViaSep, name_beg);
+  if (via == std::string::npos) return false;
+  const std::string spell_name = s.substr(name_beg, via - name_beg);
+
+  const size_t bot_beg = via + (sizeof(kViaSep) - 1);
+  const size_t id_mark = s.find(kIdSep, bot_beg);
+  if (id_mark == std::string::npos) return false;
+  const std::string bot_name = s.substr(bot_beg, id_mark - bot_beg);
+
+  const size_t id_beg = id_mark + (sizeof(kIdSep) - 1);
+  const size_t id_end = s.find(')', id_beg);
+  if (id_end == std::string::npos) return false;
+  const int spell_id = std::atoi(s.substr(id_beg, id_end - id_beg).c_str());
+  if (spell_id <= 0 || bot_name.empty() || cls.empty()) return false;
+
+  // Label "<CLS> <SpellName>", hard-truncated to 15 (social Name field).
+  std::string label = cls + " " + spell_name;
   if (label.size() > 15) label.resize(15);
-
-  std::string line = "^cast spellid " + std::to_string(spell_id) + " byname " + bot->Name;
+  const std::string line = "^cast spellid " + std::to_string(spell_id) + " byname " + bot_name;
 
   const int slot = create_social(label.c_str(), line.c_str());
-  if (slot < 0) {
-    Zeal::Game::print_chat(USERCOLOR_SHOUT,
-                           "[Add Button] No free social slots -- free one and try again.");
+
+  // Suppress the raw signal; show a clean confirmation via the ORIGINAL
+  // dsp_chat (bypasses our detour -> no recursion).
+  char confirm[200];
+  if (slot >= 0) {
+    _snprintf_s(confirm, sizeof(confirm), _TRUNCATE,
+                "Bot cast button created: %s -- open Socials and drag it onto a hotbar.", label.c_str());
   } else {
-#if BOT_CAST_BUTTON_DIAGNOSE
-    Zeal::Game::print_chat(USERCOLOR_SPELLS,
-                           "[Add Button] Created social '%s' (slot %d): %s. Open Socials and drag it onto a hotbar.",
-                           label.c_str(), slot, line.c_str());
-#else
-    Zeal::Game::print_chat(USERCOLOR_SPELLS,
-                           "[Add Button] Created social '%s' -- open Socials and drag it onto a hotbar.",
-                           label.c_str());
-#endif
+    _snprintf_s(confirm, sizeof(confirm), _TRUNCATE,
+                "Couldn't create that bot cast button: no free social slots (free one and retry).");
   }
-  return true;  // suppress: the marker packet never reaches the server
+  if (g_dsp_hook) {
+    g_dsp_hook->original(static_cast<dsp_chat_fn>(nullptr))(confirm, color, p3, add_log);
+  }
+  return true;
 }
 
-void BotCastButton::print_diag() {
-  FILE *f = nullptr;
-  fopen_s(&f, "D:/EQEmu/Full_RoF2/acb_diag.txt", "w");
-  if (!f) return;
-  const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(NULL));
-  std::fprintf(f, "ACB load diagnostic (S56)\n");
-  std::fprintf(f, "base=0x%08X delta=0x%08X\n", static_cast<unsigned>(base), static_cast<unsigned>(aslr_delta_));
-
-  // Bytes at the inherited hook targets. They live in .text; with ASLR the raw
-  // addresses may land elsewhere, so guard every read. A clean function
-  // prologue (e.g. 8B FF 55 8B EC) means plausibly-right; garbage/unreadable
-  // means the inherited address is wrong for our binary.
-  auto report = [f](const char *label, uintptr_t a) {
-    const unsigned char *p = reinterpret_cast<const unsigned char *>(a);
-    if (!IsBadReadPtr(p, 6)) {
-      std::fprintf(f, "%s @0x%08X: %02X %02X %02X %02X %02X %02X\n", label, static_cast<unsigned>(a), p[0], p[1],
-                   p[2], p[3], p[4], p[5]);
-    } else {
-      std::fprintf(f, "%s @0x%08X: <unreadable>\n", label, static_cast<unsigned>(a));
-    }
-  };
-  report("send(0x54E51A)", 0x0054E51A);  // inherited SendMessage hook target
-  report("cmd (0x54572F)", 0x0054572F);  // inherited InterpretCmd hook target
-  report("win (0x63D5CC)", 0x0063D5CC);  // inherited window-manager table base
-  std::fprintf(f, "social rec0 (delta-adjusted)=0x%08X\n", static_cast<unsigned>(kSocialRecordsBase + aslr_delta_));
-  std::fclose(f);
+void __stdcall dsp_chat_detour(const char *text, int color, int p3, int add_log) {
+  if (handle_signal_line(text, color, p3, add_log)) return;  // ours -> suppressed
+  if (g_dsp_hook) {
+    g_dsp_hook->original(static_cast<dsp_chat_fn>(nullptr))(text, color, p3, add_log);
+  }
 }
 
-BotCastButton::BotCastButton(ZealService *zeal) {
-  aslr_delta_ = reinterpret_cast<uintptr_t>(GetModuleHandleA(NULL)) - 0x00400000;
+}  // namespace
 
-  zeal->callbacks->AddPacket(
-      [this](UINT opcode, char *buffer, UINT len) { return handle_outgoing_packet(opcode, buffer, len); },
-      callback_type::SendMessage_);
+bool install(std::uintptr_t aslr_delta) {
+  g_aslr_delta = aslr_delta;
+  const uintptr_t runtime = kDspChatGhidra + aslr_delta;
+
+  const bool sig_ok =
+      !IsBadReadPtr(reinterpret_cast<const void *>(runtime), sizeof(kDspChatSig)) &&
+      std::memcmp(reinterpret_cast<const void *>(runtime), kDspChatSig, sizeof(kDspChatSig)) == 0;
 
 #if BOT_CAST_BUTTON_DIAGNOSE
-  // The inherited command + packet-send hooks are unreliable on our binary, so
-  // chat/command diagnostics can't be trusted. Write a load-time diagnostic to
-  // a file from the ctor (which runs whenever Zeal loads) -- the reliable
-  // channel for the ASLR delta + the state of the inherited hook addresses.
-  print_diag();
+  // Fresh file each load (truncate), then append.
+  {
+    FILE *f = nullptr;
+    fopen_s(&f, "D:/EQEmu/Full_RoF2/acb_diag.txt", "w");
+    if (f) std::fclose(f);
+  }
+  const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(NULL));
+  diag_file("ACB install diagnostic (S57 server-signal)\n");
+  diag_file("base=0x%08X delta=0x%08X\n", static_cast<unsigned>(base), static_cast<unsigned>(aslr_delta));
+  diag_file("dsp_chat ghidra=0x%08X runtime=0x%08X sig_ok=%d\n", static_cast<unsigned>(kDspChatGhidra),
+            static_cast<unsigned>(runtime), sig_ok ? 1 : 0);
+  diag_file("social rec0 (delta-adjusted)=0x%08X\n",
+            static_cast<unsigned>(kSocialRecordsBase + aslr_delta));
 #endif
+
+  if (!sig_ok) return false;  // wrong address for this binary -> silent no-op
+
+  g_dsp_hook = new hook(runtime, &dsp_chat_detour, hook_type_detour);
+
+#if BOT_CAST_BUTTON_DIAGNOSE
+  diag_file("dsp_chat detour INSTALLED.\n");
+#endif
+  return true;
 }
 
-BotCastButton::~BotCastButton() {}
+}  // namespace bot_cast_button

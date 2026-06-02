@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "bot_cast_button.h"
 #include "lmb_pan.h"
 #include "zeal.h"
 
@@ -234,6 +235,14 @@ static void handle_process_attach() {
   // inside lmb_pan::install — silently no-ops on mismatch.
   lmb_pan::install(aslr_delta);
 #endif
+
+  // Theo-and-Co S57: [Add Button] bot cast-social. Detours dsp_chat (the chat
+  // display fn) to catch the engine's confirmation line and create a hotbar
+  // social. Installed directly here -- NOT via ZealService, which is gated off
+  // (ZEAL_ROF2_LAYER0_VALIDATION) because its submodules reference 2002-client
+  // addresses wrong for our binary. Signature-gated inside install() -> silent
+  // no-op on mismatch, like lmb_pan.
+  bot_cast_button::install(aslr_delta);
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {

@@ -13,7 +13,6 @@
 #include "autofire.h"
 #include "bandolier.h"
 #include "binds.h"
-#include "bot_cast_button.h"
 #include "buff_timers.h"
 #include "callbacks.h"
 #include "camera_mods.h"
@@ -144,7 +143,6 @@ ZealService::ZealService() {
   buff_timers = MakeCheckedUnique(BuffTimers);
   helm = MakeCheckedUnique(HelmManager);
   bandolier = MakeCheckedUnique(Bandolier);
-  bot_cast_button = MakeCheckedUnique(BotCastButton);  // Theo S56: [Add Button] bot cast-social (uses callbacks).
 
   // Adds DirectX (and UISkin for resource file paths) dependencies.
   target_ring = MakeCheckedUnique(TargetRing);
