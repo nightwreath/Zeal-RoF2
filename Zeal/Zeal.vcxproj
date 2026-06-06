@@ -72,6 +72,7 @@
     <ClInclude Include="bot_cast_button.h" />
     <ClInclude Include="hide_self_name.h" />
     <ClInclude Include="theo_commands.h" />
+    <ClInclude Include="fov_mod.h" />
     <ClInclude Include="bitmap_font.h" />
     <ClInclude Include="operator_overloads.h" />
     <ClInclude Include="character_select.h" />
@@ -162,6 +163,7 @@
     <ClCompile Include="bot_cast_button.cpp" />
     <ClCompile Include="hide_self_name.cpp" />
     <ClCompile Include="theo_commands.cpp" />
+    <ClCompile Include="fov_mod.cpp" />
     <ClCompile Include="bitmap_font.cpp" />
     <ClCompile Include="character_select.cpp" />
     <ClCompile Include="chatfilter.cpp" />

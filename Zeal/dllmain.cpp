@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "bot_cast_button.h"
+#include "fov_mod.h"
 #include "hide_self_name.h"
 #include "lmb_pan.h"
 #include "theo_commands.h"
@@ -259,6 +260,12 @@ static void handle_process_attach() {
   // directly here, NOT via the gated ZealService. Signature-gated -> silent
   // no-op on mismatch.
   theo_commands::install(aslr_delta);
+
+  // Theo-and-Co S62: field-of-view control (/fov). Hooks t3dSetCameraLens (a
+  // named export of the graphics DLL -- resolved via GetProcAddress, so no
+  // address/ASLR math). Best-effort here; if the graphics DLL isn't loaded yet
+  // the first /fov use installs the hook. Seeds the saved FOV from zeal.ini.
+  fov_mod::install();
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {

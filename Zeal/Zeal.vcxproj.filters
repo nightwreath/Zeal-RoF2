@@ -315,6 +315,9 @@
     <ClInclude Include="theo_commands.h">
       <Filter>Header Files\hooks</Filter>
     </ClInclude>
+    <ClInclude Include="fov_mod.h">
+      <Filter>Header Files\hooks</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">
@@ -552,6 +555,9 @@
       <Filter>Source Files\hooks</Filter>
     </ClCompile>
     <ClCompile Include="theo_commands.cpp">
+      <Filter>Source Files\hooks</Filter>
+    </ClCompile>
+    <ClCompile Include="fov_mod.cpp">
       <Filter>Source Files\hooks</Filter>
     </ClCompile>
   </ItemGroup>
