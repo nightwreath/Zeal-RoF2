@@ -55,8 +55,6 @@ uintptr_t g_eqgame_delta = 0;
 hook *g_hook = nullptr;
 float g_fov = kDefaultFov;
 bool g_enabled = false;
-float g_default_fov = kDefaultFov;  // the game's own FOV, captured live (for /fov off)
-bool g_overrode = false;
 
 #if FOV_MOD_DIAGNOSE
 bool g_logged_first = false;
@@ -78,28 +76,24 @@ bool in_world() {
 }
 
 void __fastcall frustum_detour(int frustum) {
-  if (frustum) {
+  if (g_enabled && frustum) {
     float *pfov = reinterpret_cast<float *>(frustum + kFovFieldOff);
     if (!IsBadReadPtr(pfov, sizeof(float))) {
-      const float cur = *pfov;
-      const bool sane = (cur >= kOverrideLo && cur <= kOverrideHi);
+      const float orig = *pfov;
 #if FOV_MOD_DIAGNOSE
       if (!g_logged_first) {
         g_logged_first = true;
-        diag("first frustum call: FOV=%g in_world=%d (g_fov=%g)\n", cur, in_world() ? 1 : 0, g_fov);
+        diag("first frustum call: FOV=%g in_world=%d (g_fov=%g)\n", orig, in_world() ? 1 : 0, g_fov);
       }
 #endif
-      // Persist the FOV field (NO restore) so the projection AND the zone cull
-      // frustum both read our value -- restoring it left culling at the default
-      // (render-wider-than-cull = edge clipping). In-world only (skip the
-      // char-select preview) + plausible world FOV.
-      if (g_enabled && in_world() && sane) {
-        if (cur != g_fov) g_default_fov = cur;  // remember the game's own value
+      // Override ONLY for the projection build, then restore -- [frustum+4] is
+      // also read by the camera/zoom system, so a persistent change zooms the
+      // camera. In-world only (skip char-select) + plausible world FOV.
+      if (in_world() && orig >= kOverrideLo && orig <= kOverrideHi) {
         *pfov = g_fov;
-        g_overrode = true;
-      } else if (g_overrode && sane && cur == g_fov) {
-        *pfov = g_default_fov;  // disabled / left world: hand the default back once
-        g_overrode = false;
+        g_hook->original(static_cast<frustum_fn>(nullptr))(frustum);
+        *pfov = orig;
+        return;
       }
     }
   }
