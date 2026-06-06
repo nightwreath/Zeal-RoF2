@@ -8,24 +8,30 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "hook_wrapper.h"  // standalone `hook` class (detour) -- no ZealService needed
 
 // Ship the diagnostic with v1 (feedback_diagnostics_from_v1.md). When 1,
-// install() + ensure_hook() write .\fov_diag.txt with which graphics DLL was
-// found, the t3dSetCameraLens address, hook status, and the seeded value -- so
-// a not-yet-loaded gfx DLL / missing export surfaces in one launch.
+// install()/ensure_hook() + the first detour call write .\fov_diag.txt (module
+// base, frustum-fn address, signature match, and the observed default FOV) so a
+// not-yet-loaded DLL / wrong build surfaces in one launch.
 #define FOV_MOD_DIAGNOSE 1
 
 namespace fov_mod {
 
 namespace {
 
-// t3dSetCameraLens(int a1, float fov, float aspect_ratio, float a4, float a5).
-// The t3d* graphics API is C-style __cdecl (matches upstream Zeal's hook decl).
-// t3d stores CameraInfo.FieldOfView = 0.5 * fov, so to get an effective FOV of
-// `v` we pass fov = 2*v.
-using lens_fn = int(__cdecl *)(int a1, float fov, float aspect_ratio, float a4, float a5);
+// EQGraphicsDX9.dll frustum/perspective builder. RVA 0x6470 (image base
+// 0x10000000). __fastcall(int frustum): ECX = frustum; [frustum+4] = FOV in
+// degrees (FLD [ESI+4]; FMUL deg2rad/2; -> D3DXMatrixPerspectiveRH). The
+// prologue is all register/immediate ops (no relocations) -> a stable guard.
+constexpr char kGfxDll[] = "EQGraphicsDX9.dll";
+constexpr unsigned kFrustumRva = 0x6470;
+constexpr int kFovFieldOff = 4;
+constexpr unsigned char kSig[15] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x81, 0xEC,
+                                    0x48, 0x02, 0x00, 0x00, 0x56, 0x8B, 0xF1};
+using frustum_fn = void(__fastcall *)(int frustum);
 
 constexpr char kZealIni[] = ".\\zeal.ini";
 constexpr char kSection[] = "Zeal";
@@ -34,12 +40,17 @@ constexpr char kKeyFov[] = "Fov";
 constexpr float kMinFov = 45.0f;
 constexpr float kMaxFov = 90.0f;
 constexpr float kDefaultFov = 45.0f;
+// Only override frustums whose stored FOV looks like a world perspective (deg),
+// so we don't disturb any non-world frustum that reuses this fn.
+constexpr float kOverrideLo = 20.0f;
+constexpr float kOverrideHi = 120.0f;
 
 hook *g_hook = nullptr;
 float g_fov = kDefaultFov;
 bool g_enabled = false;
 
 #if FOV_MOD_DIAGNOSE
+bool g_logged_first = false;
 void diag(const char *fmt, ...) {
   FILE *f = nullptr;
   fopen_s(&f, ".\\fov_diag.txt", "a");
@@ -52,30 +63,42 @@ void diag(const char *fmt, ...) {
 }
 #endif
 
-int __cdecl lens_detour(int a1, float fov, float aspect_ratio, float a4, float a5) {
-  if (g_enabled) fov = 2.0f * g_fov;  // 2x: t3d halves it internally
-  return g_hook->original(static_cast<lens_fn>(nullptr))(a1, fov, aspect_ratio, a4, a5);
+void __fastcall frustum_detour(int frustum) {
+  if (g_enabled && frustum) {
+    float *pfov = reinterpret_cast<float *>(frustum + kFovFieldOff);
+    if (!IsBadReadPtr(pfov, sizeof(float))) {
+      const float orig = *pfov;
+#if FOV_MOD_DIAGNOSE
+      if (!g_logged_first) {
+        g_logged_first = true;
+        diag("first frustum call: default FOV=%g (overriding to %g)\n", orig, g_fov);
+      }
+#endif
+      if (orig >= kOverrideLo && orig <= kOverrideHi) {
+        *pfov = g_fov;
+        g_hook->original(static_cast<frustum_fn>(nullptr))(frustum);
+        *pfov = orig;  // restore -> no permanent mutation
+        return;
+      }
+    }
+  }
+  g_hook->original(static_cast<frustum_fn>(nullptr))(frustum);
 }
 
-HMODULE find_gfx_module() {
-  HMODULE h = GetModuleHandleA("EQGraphicsDX9.dll");  // what RoF2 loads
-  if (!h) h = GetModuleHandleA("eqgfx_dx8.dll");       // legacy fallback
-  return h;
-}
-
-// Installs the SetCameraLens hook if not already in. Returns true once hooked.
 bool ensure_hook() {
   if (g_hook) return true;
-  HMODULE gfx = find_gfx_module();
-  FARPROC fn = gfx ? GetProcAddress(gfx, "t3dSetCameraLens") : nullptr;
+  HMODULE gfx = GetModuleHandleA(kGfxDll);
+  const uintptr_t fn = gfx ? (reinterpret_cast<uintptr_t>(gfx) + kFrustumRva) : 0;
+  bool sig_ok = fn && !IsBadReadPtr(reinterpret_cast<void *>(fn), sizeof(kSig)) &&
+                std::memcmp(reinterpret_cast<void *>(fn), kSig, sizeof(kSig)) == 0;
 #if FOV_MOD_DIAGNOSE
-  diag("ensure_hook: gfx_module=0x%08X t3dSetCameraLens=0x%08X\n", reinterpret_cast<unsigned>(gfx),
-       reinterpret_cast<unsigned>(fn));
+  diag("ensure_hook: gfx=0x%08X frustum_fn=0x%08X sig_ok=%d\n", reinterpret_cast<unsigned>(gfx),
+       static_cast<unsigned>(fn), sig_ok ? 1 : 0);
 #endif
-  if (!fn) return false;  // gfx DLL not loaded yet, or export missing
-  g_hook = new hook(reinterpret_cast<int>(fn), &lens_detour, hook_type_detour);
+  if (!sig_ok) return false;
+  g_hook = new hook(static_cast<int>(fn), &frustum_detour, hook_type_detour);
 #if FOV_MOD_DIAGNOSE
-  diag("SetCameraLens detour INSTALLED at 0x%08X\n", reinterpret_cast<unsigned>(fn));
+  diag("frustum detour INSTALLED at 0x%08X\n", static_cast<unsigned>(fn));
 #endif
   return true;
 }
@@ -107,9 +130,8 @@ bool install() {
     fopen_s(&f, ".\\fov_diag.txt", "w");
     if (f) std::fclose(f);
   }
-  diag("fov_mod install diagnostic (S62)\n");
+  diag("fov_mod install diagnostic (S62, DX9 frustum hook)\n");
 #endif
-  // Seed from zeal.ini [Zeal] Fov; a value in range enables the override.
   char buf[32] = {0};
   GetPrivateProfileStringA(kSection, kKeyFov, "0", buf, sizeof(buf), kZealIni);
   const float f = static_cast<float>(std::atof(buf));
@@ -120,9 +142,7 @@ bool install() {
 #if FOV_MOD_DIAGNOSE
   diag("seeded Fov=%g enabled=%d\n", g_fov, g_enabled ? 1 : 0);
 #endif
-  // Try to hook now (graphics DLL is usually loaded by the time .asi loads at
-  // sound init). If not, the first /fov use installs it.
-  return ensure_hook();
+  return ensure_hook();  // installs now if the gfx DLL is loaded; else first /fov does it
 }
 
 }  // namespace fov_mod

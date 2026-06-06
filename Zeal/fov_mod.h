@@ -3,30 +3,29 @@
 #include <cstdint>
 
 // Theo-and-Co field-of-view control (S62, Phase 1). Widens the camera FOV
-// (45-90; default ~45) by hooking t3dSetCameraLens -- the graphics-engine
-// function the client calls every frame to set up the 3D projection -- and
-// overriding its fov argument. A one-time write to CameraInfo.FieldOfView would
-// be clobbered by the next frame's SetCameraLens call, so the per-frame hook is
-// the robust path (this mirrors upstream Zeal's /fov).
+// (45-90; default ~45). Our client renders via EQGraphicsDX9.dll, whose C++
+// engine dropped the old t3dSetCameraLens export the 2002 client (and upstream
+// Zeal) used -- so we hook the DX9 frustum/perspective builder directly:
 //
-// t3dSetCameraLens is a NAMED EXPORT of the graphics DLL, so unlike the rest of
-// our hooks it needs no Ghidra address / ASLR math -- GetProcAddress gives the
-// real runtime address. Our client loads EQGraphicsDX9.dll (not the 2002
-// client's eqgfx_dx8.dll that upstream Zeal looks up), so we try the DX9 name
-// first with the DX8 name as a fallback. Persists the choice in zeal.ini
-// [Zeal] Fov. See memory/project_zeal_hide_name_and_commands.md.
+//   EQGraphicsDX9.dll FUN_10006470 (RVA 0x6470) does
+//     fov_rad_half = fptan([frustum+4] * deg2rad/2);  -> D3DXMatrixPerspectiveRH
+//   i.e. [frustum+4] is the FOV in DEGREES (Ghidra-verified, S62).
+//
+// We resolve it as GetModuleHandle("EQGraphicsDX9.dll") + 0x6470 (no Ghidra/ASLR
+// math -- RVA is fixed), detour it, and while enabled temporarily override
+// [frustum+4] with our FOV for the projection compute, then restore it (no
+// permanent mutation; /fov off reverts instantly). Persists in zeal.ini
+// [Zeal] Fov. Details + RE chain in memory/project_zeal_hide_name_and_commands.md.
 namespace fov_mod {
 
 // Best-effort install from dllmain: seeds the saved FOV from zeal.ini and, if
-// the graphics DLL is already loaded, installs the SetCameraLens hook so the
-// saved FOV applies from the first frame. If the DLL isn't loaded yet, the hook
-// is installed lazily on the first /fov use (set_fov -> ensure_hook). Returns
-// true if the hook went in.
+// EQGraphicsDX9.dll is already loaded, installs the frustum hook so the saved
+// FOV applies from the first frame. If the DLL isn't loaded yet, the hook is
+// installed lazily on the first /fov use. Returns true if the hook went in.
 bool install();
 
-// Set the FOV (45-90), enable the override, persist, and ensure the hook is
-// installed. Returns false on an out-of-range value or if the hook can't be
-// installed (graphics DLL/export missing).
+// Set the FOV (45-90), enable the override, persist, ensure the hook installs.
+// Returns false on out-of-range or if the hook can't install (DLL not ready).
 bool set_fov(float fov);
 
 // Revert to the game's default FOV (disable the override) and persist.
