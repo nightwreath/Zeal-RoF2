@@ -5,6 +5,7 @@
 #include "bot_cast_button.h"
 #include "hide_self_name.h"
 #include "lmb_pan.h"
+#include "theo_commands.h"
 #include "zeal.h"
 
 // Layer 0 addresses ported from 2002 client to RoF2 (Session 9 Ghidra work,
@@ -251,6 +252,13 @@ static void handle_process_attach() {
   // gated ZealService. Signature-gated inside install() -> silent no-op on
   // mismatch, like lmb_pan / bot_cast_button.
   hide_self_name::install(aslr_delta);
+
+  // Theo-and-Co S62: in-game slash commands. Detours CEverQuest::InterpretCmd
+  // (the typed-command processor) and dispatches our own commands (/hidename,
+  // /zeal); everything else passes through to the client unchanged. Installed
+  // directly here, NOT via the gated ZealService. Signature-gated -> silent
+  // no-op on mismatch.
+  theo_commands::install(aslr_delta);
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
