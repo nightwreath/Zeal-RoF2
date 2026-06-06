@@ -45,10 +45,13 @@ constexpr float kDefaultFov = 45.0f;
 constexpr float kOverrideLo = 20.0f;
 constexpr float kOverrideHi = 120.0f;
 
-// In-world gate: don't widen the character-select 3D preview (it distorts the
-// model). The local-player global (eqgame.exe 0x00dd2630, the same one
-// hide_self_name + InterpretCmd use) is null until you're in the world.
-constexpr uintptr_t kSelfGlobal = 0x00dd2630;
+// In-game gate: don't widen the character-select 3D preview (its Self entity is
+// non-null, so an entity check is useless). Gate on game->game_state instead:
+// game object global = 0x00e67ccc (assigned by the ctor FUN_005338a0);
+// game_state at +0x5c8 (Ghidra-verified: compared ==5 INGAME / ==1 CHARSELECT).
+constexpr uintptr_t kGameGlobal = 0x00e67ccc;
+constexpr uintptr_t kGameStateOff = 0x5c8;
+constexpr int kGameStateInGame = 5;  // GAMESTATE_INGAME
 constexpr uintptr_t kEqgamePreferredBase = 0x00400000;
 uintptr_t g_eqgame_delta = 0;
 
@@ -70,9 +73,14 @@ void diag(const char *fmt, ...) {
 }
 #endif
 
-bool in_world() {
-  void **p = reinterpret_cast<void **>(kSelfGlobal + g_eqgame_delta);
-  return !IsBadReadPtr(p, sizeof(void *)) && *p != nullptr;
+bool in_game() {
+  void **pgame = reinterpret_cast<void **>(kGameGlobal + g_eqgame_delta);
+  if (IsBadReadPtr(pgame, sizeof(void *))) return false;
+  void *game = *pgame;
+  if (!game) return false;
+  int *pstate = reinterpret_cast<int *>(reinterpret_cast<char *>(game) + kGameStateOff);
+  if (IsBadReadPtr(pstate, sizeof(int))) return false;
+  return *pstate == kGameStateInGame;  // not char-select / loading
 }
 
 void __fastcall frustum_detour(int frustum) {
@@ -83,13 +91,13 @@ void __fastcall frustum_detour(int frustum) {
 #if FOV_MOD_DIAGNOSE
       if (!g_logged_first) {
         g_logged_first = true;
-        diag("first frustum call: FOV=%g in_world=%d (g_fov=%g)\n", orig, in_world() ? 1 : 0, g_fov);
+        diag("first frustum call: FOV=%g in_game=%d (g_fov=%g)\n", orig, in_game() ? 1 : 0, g_fov);
       }
 #endif
       // Override ONLY for the projection build, then restore -- [frustum+4] is
       // also read by the camera/zoom system, so a persistent change zooms the
-      // camera. In-world only (skip char-select) + plausible world FOV.
-      if (in_world() && orig >= kOverrideLo && orig <= kOverrideHi) {
+      // camera. In-game only (skip char-select preview) + plausible world FOV.
+      if (in_game() && orig >= kOverrideLo && orig <= kOverrideHi) {
         *pfov = g_fov;
         g_hook->original(static_cast<frustum_fn>(nullptr))(frustum);
         *pfov = orig;
