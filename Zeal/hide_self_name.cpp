@@ -14,7 +14,7 @@
 // install() writes .\hsn_diag.txt (next to eqclient.ini) with base + ASLR delta
 // + signature match + the seeded flag, so a wrong address / non-install / wrong
 // build surfaces in a single launch. Flip to 0 once verified stable in-game.
-#define HIDE_SELF_NAME_DIAGNOSE 1
+#define HIDE_SELF_NAME_DIAGNOSE 0
 
 namespace hide_self_name {
 

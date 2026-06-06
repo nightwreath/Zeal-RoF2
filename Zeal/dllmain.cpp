@@ -245,7 +245,10 @@ static void handle_process_attach() {
   // (ZEAL_ROF2_LAYER0_VALIDATION) because its submodules reference 2002-client
   // addresses wrong for our binary. Signature-gated inside install() -> silent
   // no-op on mismatch, like lmb_pan.
-  bot_cast_button::install(aslr_delta);
+  // SHIP S63: NOT installed. The [Add Button] feature depends on a server-side
+  // signal that isn't confirmed live; shipping "hide-name only" leaves it out.
+  // Code preserved on the branch -- re-enable once the engine side is verified.
+  // bot_cast_button::install(aslr_delta);
 
   // Theo-and-Co S62: hide-your-own-overhead-name. Detours SetNameSpriteState
   // (the name-sprite show/hide decision fn) and forces show=0 for the local
@@ -261,11 +264,10 @@ static void handle_process_attach() {
   // no-op on mismatch.
   theo_commands::install(aslr_delta);
 
-  // Theo-and-Co S62: field-of-view control (/fov). Hooks t3dSetCameraLens (a
-  // named export of the graphics DLL -- resolved via GetProcAddress, so no
-  // address/ASLR math). Best-effort here; if the graphics DLL isn't loaded yet
-  // the first /fov use installs the hook. Seeds the saved FOV from zeal.ini.
-  fov_mod::install();
+  // SHIP S63: /fov NOT installed. The nameplate rendering could not be made
+  // correct at a widened FOV (names stopped rendering at distance); /fov is
+  // shelved. Module + command removed from this build; code preserved on branch.
+  // fov_mod::install();
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {

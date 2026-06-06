@@ -12,14 +12,13 @@
 #include <string>
 #include <vector>
 
-#include "fov_mod.h"
 #include "hide_self_name.h"
 #include "hook_wrapper.h"  // standalone `hook` class (detour) -- no ZealService needed
 
 // Ship the diagnostic with v1 (feedback_diagnostics_from_v1.md). When 1,
 // install() writes .\theocmd_diag.txt with base + ASLR delta + signature match
 // so a wrong address / non-install / wrong build surfaces in one launch.
-#define THEO_COMMANDS_DIAGNOSE 1
+#define THEO_COMMANDS_DIAGNOSE 0
 
 namespace theo_commands {
 
@@ -98,37 +97,10 @@ void cmd_hidename(const std::vector<std::string> &args) {
   chat("Your own overhead name is now %s.", hide_self_name::is_hidden() ? "HIDDEN" : "shown");
 }
 
-void cmd_fov(const std::vector<std::string> &args) {
-  if (args.size() >= 2) {
-    const std::string a = lower(args[1]);
-    if (a == "off" || a == "default" || a == "0") {
-      fov_mod::disable();
-      chat("Field of view reset to the game default (45).");
-      return;
-    }
-    char *end = nullptr;
-    const float f = std::strtof(args[1].c_str(), &end);
-    if (end == args[1].c_str() || f < 45.0f || f > 90.0f) {
-      chat("Usage: /fov <45-90>   (or /fov off)");
-      return;
-    }
-    if (fov_mod::set_fov(f)) {
-      chat("Field of view set to %g (default 45).", f);
-    } else {
-      chat("Couldn't set FOV yet -- try again once you're in the world.");
-    }
-  } else if (fov_mod::is_enabled()) {
-    chat("Current field of view: %g (default 45).  /fov off to reset.", fov_mod::get_fov());
-  } else {
-    chat("Field of view: game default (45).  /fov <45-90> to widen.");
-  }
-}
-
 void cmd_zeal(const std::vector<std::string> &args) {
   (void)args;
   chat("Theo & Co commands:");
   chat("   /hidename [on|off]  - hide or show your own overhead name (no arg = toggle)");
-  chat("   /fov <45-90>        - widen the camera field of view (/fov off resets)");
   chat("   /zeal               - show this list");
 }
 
@@ -139,7 +111,6 @@ struct Command {
 
 const Command kCommands[] = {
     {"/hidename", &cmd_hidename},
-    {"/fov", &cmd_fov},
     {"/zeal", &cmd_zeal},
 };
 
