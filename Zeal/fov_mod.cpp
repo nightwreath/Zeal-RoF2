@@ -33,6 +33,22 @@ constexpr unsigned char kSig[15] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x81, 0x
                                     0x48, 0x02, 0x00, 0x00, 0x56, 0x8B, 0xF1};
 using frustum_fn = void(__fastcall *)(int frustum);
 
+// EQGraphicsDX9.dll dPVS occlusion-cull frustum builder, RVA 0xed20.
+// __fastcall(scene). It reads the CULL camera's FOV (a different camera object
+// from the projection's), fptan's it, and calls DPVS::Camera::setFrustum -- so
+// widening only the projection left the cull at 45 (distant geometry culled when
+// panning). We bracket [cullcam+4] during this fn too. Ghidra-verified deref:
+//   B       = *(gfxbase + 0x179108)       (DAT_10179108 content)
+//   cullcam = *(B + 0x34)                  (B[0xd])
+//   FOV     = *(float*)(cullcam + 4)       (vtable getter returns [cullcam+4])
+// Prologue is all reg/imm ops up to the SEH-handler push -> 14-byte stable guard.
+constexpr unsigned kCullRva = 0xed20;
+constexpr unsigned kEngineGlobalRva = 0x179108;
+constexpr int kCullCamPtrOff = 0x34;
+constexpr unsigned char kCullSig[14] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x64,
+                                        0xA1, 0x00, 0x00, 0x00, 0x00, 0x6A, 0xFF};
+using cull_fn = void(__fastcall *)(void *scene);
+
 constexpr char kZealIni[] = ".\\zeal.ini";
 constexpr char kSection[] = "Zeal";
 constexpr char kKeyFov[] = "Fov";
@@ -55,12 +71,15 @@ constexpr int kGameStateInGame = 5;  // GAMESTATE_INGAME
 constexpr uintptr_t kEqgamePreferredBase = 0x00400000;
 uintptr_t g_eqgame_delta = 0;
 
-hook *g_hook = nullptr;
+hook *g_hook = nullptr;       // projection (FUN_10006470)
+hook *g_cull_hook = nullptr;  // dPVS cull frustum (FUN_1000ed20)
+uintptr_t g_gfx_base = 0;     // EQGraphicsDX9.dll runtime base
 float g_fov = kDefaultFov;
 bool g_enabled = false;
 
 #if FOV_MOD_DIAGNOSE
 bool g_logged_first = false;
+bool g_logged_cull = false;
 void diag(const char *fmt, ...) {
   FILE *f = nullptr;
   fopen_s(&f, ".\\fov_diag.txt", "a");
@@ -108,22 +127,83 @@ void __fastcall frustum_detour(int frustum) {
   g_hook->original(static_cast<frustum_fn>(nullptr))(frustum);
 }
 
+// Resolves the dPVS cull camera's FOV field: *( *(gfxbase+0x179108) + 0x34 ) + 4.
+// Guarded at each dereference. Returns nullptr if not resolvable yet.
+float *cull_fov_field() {
+  if (!g_gfx_base) return nullptr;
+  void **pB = reinterpret_cast<void **>(g_gfx_base + kEngineGlobalRva);
+  if (IsBadReadPtr(pB, sizeof(void *)) || !*pB) return nullptr;
+  void **pcam = reinterpret_cast<void **>(reinterpret_cast<char *>(*pB) + kCullCamPtrOff);
+  if (IsBadReadPtr(pcam, sizeof(void *)) || !*pcam) return nullptr;
+  float *pfov = reinterpret_cast<float *>(reinterpret_cast<char *>(*pcam) + kFovFieldOff);
+  return IsBadReadPtr(pfov, sizeof(float)) ? nullptr : pfov;
+}
+
+void __fastcall cull_detour(void *scene) {
+  if (g_enabled && in_game()) {
+    float *pfov = cull_fov_field();
+    if (pfov) {
+      const float orig = *pfov;
+#if FOV_MOD_DIAGNOSE
+      if (!g_logged_cull) {
+        g_logged_cull = true;
+        diag("first cull call: cull FOV=%g (g_fov=%g)\n", orig, g_fov);
+      }
+#endif
+      // dPVS rebuilds its frustum when the FOV changes, so it picks up g_fov.
+      // Restore after so the camera/zoom (which reads this field elsewhere) and
+      // /fov off are unaffected.
+      if (orig >= kOverrideLo && orig <= kOverrideHi) {
+        *pfov = g_fov;
+        g_cull_hook->original(static_cast<cull_fn>(nullptr))(scene);
+        *pfov = orig;
+        return;
+      }
+    }
+  }
+  g_cull_hook->original(static_cast<cull_fn>(nullptr))(scene);
+}
+
 bool ensure_hook() {
-  if (g_hook) return true;
+  if (g_hook && g_cull_hook) return true;
   HMODULE gfx = GetModuleHandleA(kGfxDll);
-  const uintptr_t fn = gfx ? (reinterpret_cast<uintptr_t>(gfx) + kFrustumRva) : 0;
-  bool sig_ok = fn && !IsBadReadPtr(reinterpret_cast<void *>(fn), sizeof(kSig)) &&
-                std::memcmp(reinterpret_cast<void *>(fn), kSig, sizeof(kSig)) == 0;
+  if (!gfx) {
 #if FOV_MOD_DIAGNOSE
-  diag("ensure_hook: gfx=0x%08X frustum_fn=0x%08X sig_ok=%d\n", reinterpret_cast<unsigned>(gfx),
-       static_cast<unsigned>(fn), sig_ok ? 1 : 0);
+    diag("ensure_hook: %s not loaded yet\n", kGfxDll);
 #endif
-  if (!sig_ok) return false;
-  g_hook = new hook(static_cast<int>(fn), &frustum_detour, hook_type_detour);
+    return false;
+  }
+  g_gfx_base = reinterpret_cast<uintptr_t>(gfx);
+
+  if (!g_hook) {
+    const uintptr_t fn = g_gfx_base + kFrustumRva;
+    const bool sig_ok = !IsBadReadPtr(reinterpret_cast<void *>(fn), sizeof(kSig)) &&
+                        std::memcmp(reinterpret_cast<void *>(fn), kSig, sizeof(kSig)) == 0;
 #if FOV_MOD_DIAGNOSE
-  diag("frustum detour INSTALLED at 0x%08X\n", static_cast<unsigned>(fn));
+    diag("ensure_hook: frustum_fn=0x%08X sig_ok=%d\n", static_cast<unsigned>(fn), sig_ok ? 1 : 0);
 #endif
-  return true;
+    if (sig_ok) {
+      g_hook = new hook(static_cast<int>(fn), &frustum_detour, hook_type_detour);
+#if FOV_MOD_DIAGNOSE
+      diag("frustum (projection) detour INSTALLED at 0x%08X\n", static_cast<unsigned>(fn));
+#endif
+    }
+  }
+  if (!g_cull_hook) {
+    const uintptr_t cfn = g_gfx_base + kCullRva;
+    const bool csig_ok = !IsBadReadPtr(reinterpret_cast<void *>(cfn), sizeof(kCullSig)) &&
+                         std::memcmp(reinterpret_cast<void *>(cfn), kCullSig, sizeof(kCullSig)) == 0;
+#if FOV_MOD_DIAGNOSE
+    diag("ensure_hook: cull_fn=0x%08X sig_ok=%d\n", static_cast<unsigned>(cfn), csig_ok ? 1 : 0);
+#endif
+    if (csig_ok) {
+      g_cull_hook = new hook(static_cast<int>(cfn), &cull_detour, hook_type_detour);
+#if FOV_MOD_DIAGNOSE
+      diag("dPVS cull detour INSTALLED at 0x%08X\n", static_cast<unsigned>(cfn));
+#endif
+    }
+  }
+  return g_hook != nullptr;  // projection is the essential hook; cull is the fix-up
 }
 
 }  // namespace
