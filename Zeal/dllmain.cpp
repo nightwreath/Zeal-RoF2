@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "bot_cast_button.h"
+#include "hide_self_name.h"
 #include "lmb_pan.h"
 #include "zeal.h"
 
@@ -243,6 +244,13 @@ static void handle_process_attach() {
   // addresses wrong for our binary. Signature-gated inside install() -> silent
   // no-op on mismatch, like lmb_pan.
   bot_cast_button::install(aslr_delta);
+
+  // Theo-and-Co S62: hide-your-own-overhead-name. Detours SetNameSpriteState
+  // (the name-sprite show/hide decision fn) and forces show=0 for the local
+  // player when the zeal.ini flag is set. Installed directly here, NOT via the
+  // gated ZealService. Signature-gated inside install() -> silent no-op on
+  // mismatch, like lmb_pan / bot_cast_button.
+  hide_self_name::install(aslr_delta);
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {

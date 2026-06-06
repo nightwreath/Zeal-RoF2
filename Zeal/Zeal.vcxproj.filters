@@ -309,6 +309,9 @@
     <ClInclude Include="bot_cast_button.h">
       <Filter>Header Files\hooks</Filter>
     </ClInclude>
+    <ClInclude Include="hide_self_name.h">
+      <Filter>Header Files\hooks</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp">
@@ -540,6 +543,9 @@
       <Filter>Source Files\hooks</Filter>
     </ClCompile>
     <ClCompile Include="bot_cast_button.cpp">
+      <Filter>Source Files\hooks</Filter>
+    </ClCompile>
+    <ClCompile Include="hide_self_name.cpp">
       <Filter>Source Files\hooks</Filter>
     </ClCompile>
   </ItemGroup>

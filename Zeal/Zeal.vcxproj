@@ -70,6 +70,7 @@
     <ClInclude Include="autofire.h" />
     <ClInclude Include="bandolier.h" />
     <ClInclude Include="bot_cast_button.h" />
+    <ClInclude Include="hide_self_name.h" />
     <ClInclude Include="bitmap_font.h" />
     <ClInclude Include="operator_overloads.h" />
     <ClInclude Include="character_select.h" />
@@ -158,6 +159,7 @@
     <ClCompile Include="autofire.cpp" />
     <ClCompile Include="bandolier.cpp" />
     <ClCompile Include="bot_cast_button.cpp" />
+    <ClCompile Include="hide_self_name.cpp" />
     <ClCompile Include="bitmap_font.cpp" />
     <ClCompile Include="character_select.cpp" />
     <ClCompile Include="chatfilter.cpp" />
