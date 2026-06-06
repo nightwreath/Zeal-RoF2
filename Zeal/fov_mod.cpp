@@ -45,6 +45,13 @@ constexpr float kDefaultFov = 45.0f;
 constexpr float kOverrideLo = 20.0f;
 constexpr float kOverrideHi = 120.0f;
 
+// In-world gate: don't widen the character-select 3D preview (it distorts the
+// model). The local-player global (eqgame.exe 0x00dd2630, the same one
+// hide_self_name + InterpretCmd use) is null until you're in the world.
+constexpr uintptr_t kSelfGlobal = 0x00dd2630;
+constexpr uintptr_t kEqgamePreferredBase = 0x00400000;
+uintptr_t g_eqgame_delta = 0;
+
 hook *g_hook = nullptr;
 float g_fov = kDefaultFov;
 bool g_enabled = false;
@@ -63,6 +70,11 @@ void diag(const char *fmt, ...) {
 }
 #endif
 
+bool in_world() {
+  void **p = reinterpret_cast<void **>(kSelfGlobal + g_eqgame_delta);
+  return !IsBadReadPtr(p, sizeof(void *)) && *p != nullptr;
+}
+
 void __fastcall frustum_detour(int frustum) {
   if (g_enabled && frustum) {
     float *pfov = reinterpret_cast<float *>(frustum + kFovFieldOff);
@@ -71,13 +83,15 @@ void __fastcall frustum_detour(int frustum) {
 #if FOV_MOD_DIAGNOSE
       if (!g_logged_first) {
         g_logged_first = true;
-        diag("first frustum call: default FOV=%g (overriding to %g)\n", orig, g_fov);
+        diag("first frustum call: default FOV=%g in_world=%d (g_fov=%g)\n", orig, in_world() ? 1 : 0, g_fov);
       }
 #endif
-      if (orig >= kOverrideLo && orig <= kOverrideHi) {
+      // In-world only + plausible world FOV -> override for the projection, then
+      // restore so nothing is permanently mutated and /fov off reverts at once.
+      if (in_world() && orig >= kOverrideLo && orig <= kOverrideHi) {
         *pfov = g_fov;
         g_hook->original(static_cast<frustum_fn>(nullptr))(frustum);
-        *pfov = orig;  // restore -> no permanent mutation
+        *pfov = orig;
         return;
       }
     }
@@ -132,6 +146,7 @@ bool install() {
   }
   diag("fov_mod install diagnostic (S62, DX9 frustum hook)\n");
 #endif
+  g_eqgame_delta = reinterpret_cast<uintptr_t>(GetModuleHandleA(NULL)) - kEqgamePreferredBase;
   char buf[32] = {0};
   GetPrivateProfileStringA(kSection, kKeyFov, "0", buf, sizeof(buf), kZealIni);
   const float f = static_cast<float>(std::atof(buf));
