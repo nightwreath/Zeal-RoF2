@@ -4,7 +4,6 @@
 
 #include <Windows.h>
 
-#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -17,7 +16,7 @@
 // install()/ensure_hook() + the first detour call write .\fov_diag.txt (module
 // base, frustum-fn address, signature match, and the observed default FOV) so a
 // not-yet-loaded DLL / wrong build surfaces in one launch.
-#define FOV_MOD_DIAGNOSE 1
+#define FOV_MOD_DIAGNOSE 0
 
 namespace fov_mod {
 
@@ -72,34 +71,6 @@ constexpr int kCullCamIdx = 0xd;    // B[0xd] = dPVS cull camera
 constexpr int kRenderCamIdx = 0xe;  // B[0xe] = render camera (drives zoom; do NOT persist)
 using orch_fn = void(__fastcall *)(int *param_1);
 
-// --- Nameplate SIZE decouple (S63) -------------------------------------------
-// Holding the cull cam at g_fov fixes the name POSITION but the name billboard
-// also projects through that camera, so at a wide FOV the quad is smaller (wider
-// FOV = smaller on screen) and names are unreadable until you're close. The name
-// is drawn by CNameStringSprite::Render = FUN_10040e50's sprite (render RVA
-// 0xb6d00); its distance cull is camera-POSITION based (FOV-independent), so names
-// aren't culled -- only shrunk. Fix: bracket the render (g_in_name) and, in the
-// quad rect setter (RVA 0xaec10), scale the rect about its center by the FOV ratio
-// so the name keeps its native readable size at the g_fov-correct center.
-//
-// CNameStringSprite::Render, __fastcall(ECX=sprite). prologue:
-//   83 EC 3C  A1 <abs 0x10179108, reloc>  56 8B 70 34 57 8B F9 8B 57 04
-//   -> match 4-byte prefix + 10-byte suffix at +8, skipping the abs-addr operand.
-constexpr unsigned kNameRenderRva = 0xb6d00;
-constexpr unsigned char kNameSigA[4] = {0x83, 0xEC, 0x3C, 0xA1};
-constexpr unsigned char kNameSigB[10] = {0x56, 0x8B, 0x70, 0x34, 0x57, 0x8B, 0xF9, 0x8B, 0x57, 0x04};
-using name_render_fn = int(__fastcall *)(void *sprite);
-
-// Name-quad rect setter, __thiscall(ECX=this, int p1, int* rect, int color, float
-// depth); rect = 4 ints {x0,y0,x1,y1}. Called once per name from the render above.
-// prologue (no relocations): D9 44 24 10 8B 54 24 08 56 8B 74 24 08 57 8B 7C 24 14 39 71
-constexpr unsigned kRectDrawRva = 0xaec10;
-constexpr unsigned char kRectSig[20] = {0xD9, 0x44, 0x24, 0x10, 0x8B, 0x54, 0x24, 0x08, 0x56, 0x8B,
-                                        0x74, 0x24, 0x08, 0x57, 0x8B, 0x7C, 0x24, 0x14, 0x39, 0x71};
-using rect_draw_fn = void(__fastcall *)(void *self, void *edx, int p1, int *rect, int color, float depth);
-
-constexpr double kDeg2RadHalf = 3.14159265358979323846 / 360.0;  // degrees -> half-angle radians
-
 constexpr char kZealIni[] = ".\\zeal.ini";
 constexpr char kSection[] = "Zeal";
 constexpr char kKeyFov[] = "Fov";
@@ -125,19 +96,14 @@ uintptr_t g_eqgame_delta = 0;
 hook *g_hook = nullptr;       // projection (FUN_10006470)
 hook *g_cull_hook = nullptr;  // dPVS cull frustum (FUN_1000ed20)
 hook *g_orch_hook = nullptr;  // render orchestrator (FUN_10097420) -- full-frame cull-FOV bracket
-hook *g_name_hook = nullptr;  // CNameStringSprite::Render -- brackets the name draw (g_in_name)
-hook *g_rect_hook = nullptr;  // name-quad rect setter -- scales the quad back to native size
 uintptr_t g_gfx_base = 0;     // EQGraphicsDX9.dll runtime base
 float g_fov = kDefaultFov;
 bool g_enabled = false;
-bool g_in_name = false;             // true only inside CNameStringSprite::Render
-float g_cull_native = kDefaultFov;  // cull cam's native FOV (captured at orch entry) for the size ratio
 
 #if FOV_MOD_DIAGNOSE
 int g_frustum_calls = 0;  // log the first few FUN_10006470 calls per launch (incl. the late piVar7 build)
 bool g_logged_cull = false;
 bool g_logged_orch = false;
-bool g_logged_rect = false;
 void diag(const char *fmt, ...) {
   FILE *f = nullptr;
   fopen_s(&f, ".\\fov_diag.txt", "a");
@@ -247,7 +213,6 @@ void __fastcall orch_detour(int *param_1) {
       }
 #endif
       if (orig >= kOverrideLo && orig <= kOverrideHi) {
-        g_cull_native = orig;  // remember the native cull FOV for the nameplate size ratio
         *pfov = g_fov;
         g_orch_hook->original(static_cast<orch_fn>(nullptr))(param_1);
         *pfov = orig;
@@ -258,45 +223,8 @@ void __fastcall orch_detour(int *param_1) {
   g_orch_hook->original(static_cast<orch_fn>(nullptr))(param_1);
 }
 
-inline int iround(float f) { return static_cast<int>(f < 0.0f ? f - 0.5f : f + 0.5f); }
-
-// CNameStringSprite::Render bracket: marks the window during which the name quad's
-// rect is set, so rect_draw_detour scales only the nameplate (FUN_100aec10 is also
-// used by other 2D draws).
-int __fastcall name_render_detour(void *sprite) {
-  if (!(g_enabled && in_game())) return g_name_hook->original(static_cast<name_render_fn>(nullptr))(sprite);
-  g_in_name = true;
-  const int r = g_name_hook->original(static_cast<name_render_fn>(nullptr))(sprite);
-  g_in_name = false;
-  return r;
-}
-
-// While inside the name render, scale the projected name quad {x0,y0,x1,y1} about
-// its center by R = tan(g_fov/2)/tan(native/2) -- restoring the native (readable)
-// on-screen size at the g_fov-correct center. Position (center) is untouched.
-void __fastcall rect_draw_detour(void *self, void *edx, int p1, int *rect, int color, float depth) {
-  if (g_enabled && g_in_name && rect && !IsBadWritePtr(rect, 4 * sizeof(int))) {
-    const float native = (g_cull_native >= kOverrideLo && g_cull_native <= kOverrideHi) ? g_cull_native : kDefaultFov;
-    float R = static_cast<float>(std::tan(g_fov * kDeg2RadHalf) / std::tan(native * kDeg2RadHalf));
-    if (R < 0.5f) R = 0.5f; else if (R > 4.0f) R = 4.0f;
-    const float cx = (rect[0] + rect[2]) * 0.5f;
-    const float cy = (rect[1] + rect[3]) * 0.5f;
-    rect[0] = iround(cx + (rect[0] - cx) * R);
-    rect[2] = iround(cx + (rect[2] - cx) * R);
-    rect[1] = iround(cy + (rect[1] - cy) * R);
-    rect[3] = iround(cy + (rect[3] - cy) * R);
-#if FOV_MOD_DIAGNOSE
-    if (!g_logged_rect) {
-      g_logged_rect = true;
-      diag("name rect scaled: R=%g (g_fov=%g native=%g)\n", R, g_fov, native);
-    }
-#endif
-  }
-  g_rect_hook->original(static_cast<rect_draw_fn>(nullptr))(self, edx, p1, rect, color, depth);
-}
-
 bool ensure_hook() {
-  if (g_hook && g_cull_hook && g_orch_hook && g_name_hook && g_rect_hook) return true;
+  if (g_hook && g_cull_hook && g_orch_hook) return true;
   HMODULE gfx = GetModuleHandleA(kGfxDll);
   if (!gfx) {
 #if FOV_MOD_DIAGNOSE
@@ -350,36 +278,7 @@ bool ensure_hook() {
 #endif
     }
   }
-  if (!g_name_hook) {
-    const uintptr_t nfn = g_gfx_base + kNameRenderRva;
-    const bool nsig_ok = !IsBadReadPtr(reinterpret_cast<void *>(nfn), 18) &&
-                         std::memcmp(reinterpret_cast<void *>(nfn), kNameSigA, sizeof(kNameSigA)) == 0 &&
-                         std::memcmp(reinterpret_cast<void *>(nfn + 8), kNameSigB, sizeof(kNameSigB)) == 0;
-#if FOV_MOD_DIAGNOSE
-    diag("ensure_hook: name_render_fn=0x%08X sig_ok=%d\n", static_cast<unsigned>(nfn), nsig_ok ? 1 : 0);
-#endif
-    if (nsig_ok) {
-      g_name_hook = new hook(static_cast<int>(nfn), &name_render_detour, hook_type_detour);
-#if FOV_MOD_DIAGNOSE
-      diag("CNameStringSprite::Render bracket detour INSTALLED at 0x%08X\n", static_cast<unsigned>(nfn));
-#endif
-    }
-  }
-  if (!g_rect_hook) {
-    const uintptr_t rfn = g_gfx_base + kRectDrawRva;
-    const bool rsig_ok = !IsBadReadPtr(reinterpret_cast<void *>(rfn), sizeof(kRectSig)) &&
-                         std::memcmp(reinterpret_cast<void *>(rfn), kRectSig, sizeof(kRectSig)) == 0;
-#if FOV_MOD_DIAGNOSE
-    diag("ensure_hook: rect_draw_fn=0x%08X sig_ok=%d\n", static_cast<unsigned>(rfn), rsig_ok ? 1 : 0);
-#endif
-    if (rsig_ok) {
-      g_rect_hook = new hook(static_cast<int>(rfn), &rect_draw_detour, hook_type_detour);
-#if FOV_MOD_DIAGNOSE
-      diag("name-quad rect-scale detour INSTALLED at 0x%08X\n", static_cast<unsigned>(rfn));
-#endif
-    }
-  }
-  return g_hook != nullptr;  // projection is the essential hook; the rest are fix-ups
+  return g_hook != nullptr;  // projection is the essential hook; cull + orchestrator are fix-ups
 }
 
 }  // namespace
@@ -409,7 +308,7 @@ bool install() {
     fopen_s(&f, ".\\fov_diag.txt", "w");
     if (f) std::fclose(f);
   }
-  diag("fov_mod install diagnostic (S63: projection + cull + orchestrator + nameplate size decouple)\n");
+  diag("fov_mod install diagnostic (S63: projection + cull + full-frame orchestrator bracket)\n");
 #endif
   g_eqgame_delta = reinterpret_cast<uintptr_t>(GetModuleHandleA(NULL)) - kEqgamePreferredBase;
   char buf[32] = {0};

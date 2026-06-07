@@ -264,10 +264,12 @@ static void handle_process_attach() {
   // no-op on mismatch.
   theo_commands::install(aslr_delta);
 
-  // SHIP S63: /fov NOT installed. The nameplate rendering could not be made
-  // correct at a widened FOV (names stopped rendering at distance); /fov is
-  // shelved. Module + command removed from this build; code preserved on branch.
-  // fov_mod::install();
+  // Theo-and-Co S62/S63: field-of-view control (/fov). Hooks the EQGraphicsDX9
+  // projection + dPVS cull + render orchestrator to widen the view and hold the
+  // cull cam wide for the frame so overhead names track heads with no zoom.
+  // (S63: the "names don't render at distance" concern was EQ's stock FOV-
+  // independent name range, not a /fov regression -- /fov is functional.)
+  fov_mod::install();
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
