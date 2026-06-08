@@ -16,7 +16,7 @@
 // install()/ensure_hook() + the first detour call write .\fov_diag.txt (module
 // base, frustum-fn address, signature match, and the observed default FOV) so a
 // not-yet-loaded DLL / wrong build surfaces in one launch.
-#define FOV_MOD_DIAGNOSE 0
+#define FOV_MOD_DIAGNOSE 1
 
 namespace fov_mod {
 
@@ -71,6 +71,25 @@ constexpr int kCullCamIdx = 0xd;    // B[0xd] = dPVS cull camera
 constexpr int kRenderCamIdx = 0xe;  // B[0xe] = render camera (drives zoom; do NOT persist)
 using orch_fn = void(__fastcall *)(int *param_1);
 
+// ⚠ RULED OUT S64: these do NOT fire on a left-click (per-call diag = zero hits) —
+// they are some other cull-cam raycast, NOT the click-target pick. KEPT only as the
+// reusable bracket PATTERN; the real pick uses the RENDER cam (B[0xe]). Re-target,
+// don't rebuild. Full hand-off: memory/project_zeal_fov.md "S64 CLICK-PICK BUG".
+// EQGraphicsDX9.dll click-pick / raycast helpers. Both __stdcall(screen_x,
+// screen_y, out*) unproject screen->world THROUGH THE CULL CAM (B[0xd]) via the
+// engine vtable +0xa4 (Ghidra FUN_100a44e0 / FUN_100a4590, called via the cull-cam
+// project vtable 0x1013e568/570). They run on mouse-click, OUTSIDE the render
+// frame, where the cull cam FOV has been restored to native 45 -> the pick ray is
+// cast at 45 while the scene was drawn at g_fov, so clicks land short of where
+// things appear (worst off-center). Bracket [cullcam+4]=g_fov during each.
+constexpr unsigned kPickARva = 0xa44e0;
+constexpr unsigned kPickBRva = 0xa4590;
+constexpr unsigned char kPickASig[14] = {0x83, 0xEC, 0x18, 0xD9, 0xEE, 0x56, 0x8B,
+                                         0x74, 0x24, 0x28, 0xD9, 0x54, 0x24, 0x10};
+constexpr unsigned char kPickBSig[14] = {0x83, 0xEC, 0x18, 0xD9, 0xEE, 0x56, 0x57,
+                                         0xD9, 0x54, 0x24, 0x14, 0x8B, 0x7C, 0x24};
+using pick_fn = unsigned(__stdcall *)(unsigned p1, unsigned p2, void *p3);
+
 constexpr char kZealIni[] = ".\\zeal.ini";
 constexpr char kSection[] = "Zeal";
 constexpr char kKeyFov[] = "Fov";
@@ -96,6 +115,8 @@ uintptr_t g_eqgame_delta = 0;
 hook *g_hook = nullptr;       // projection (FUN_10006470)
 hook *g_cull_hook = nullptr;  // dPVS cull frustum (FUN_1000ed20)
 hook *g_orch_hook = nullptr;  // render orchestrator (FUN_10097420) -- full-frame cull-FOV bracket
+hook *g_pickA_hook = nullptr;  // FUN_100a44e0 click-pick (cull-cam screen->world unproject)
+hook *g_pickB_hook = nullptr;  // FUN_100a4590 click-pick (cull-cam screen->world unproject)
 uintptr_t g_gfx_base = 0;     // EQGraphicsDX9.dll runtime base
 float g_fov = kDefaultFov;
 bool g_enabled = false;
@@ -223,8 +244,50 @@ void __fastcall orch_detour(int *param_1) {
   g_orch_hook->original(static_cast<orch_fn>(nullptr))(param_1);
 }
 
+// Click-pick / raycast FOV bracket. Hold the cull cam (B[0xd]) FOV = g_fov during
+// each screen->world unproject so the pick ray matches the rendered FOV (the scene
+// renders at g_fov, but picking runs outside the frame where the cull cam is back
+// at native 45). Same bracket shape as cull_detour; both pick helpers share it.
+unsigned pick_bracketed(hook *h, unsigned p1, unsigned p2, void *p3) {
+#if FOV_MOD_DIAGNOSE
+  {
+    // Log the first calls with a tick so we can tell a per-FRAME raycast (calls
+    // bunched within ~1s of each other) from a per-CLICK pick (calls spread out,
+    // appearing when the user clicks). cullFOV should read g_fov inside the bracket.
+    static int s_pick_n = 0;
+    if (s_pick_n < 24) {
+      ++s_pick_n;
+      float *pf = cull_fov_field();
+      diag("PICK#%d tick=%u which=%c en=%d ig=%d cullFOV=%g gfov=%g\n", s_pick_n,
+           static_cast<unsigned>(GetTickCount()), (h == g_pickA_hook) ? 'A' : 'B',
+           g_enabled ? 1 : 0, in_game() ? 1 : 0, pf ? *pf : -1.0f, g_fov);
+    }
+  }
+#endif
+  if (g_enabled && in_game()) {
+    float *pfov = cull_fov_field();
+    if (pfov) {
+      const float orig = *pfov;
+      if (orig >= kOverrideLo && orig <= kOverrideHi) {
+        *pfov = g_fov;
+        const unsigned r = h->original(static_cast<pick_fn>(nullptr))(p1, p2, p3);
+        *pfov = orig;
+        return r;
+      }
+    }
+  }
+  return h->original(static_cast<pick_fn>(nullptr))(p1, p2, p3);
+}
+
+unsigned __stdcall pickA_detour(unsigned p1, unsigned p2, void *p3) {
+  return pick_bracketed(g_pickA_hook, p1, p2, p3);
+}
+unsigned __stdcall pickB_detour(unsigned p1, unsigned p2, void *p3) {
+  return pick_bracketed(g_pickB_hook, p1, p2, p3);
+}
+
 bool ensure_hook() {
-  if (g_hook && g_cull_hook && g_orch_hook) return true;
+  if (g_hook && g_cull_hook && g_orch_hook && g_pickA_hook && g_pickB_hook) return true;
   HMODULE gfx = GetModuleHandleA(kGfxDll);
   if (!gfx) {
 #if FOV_MOD_DIAGNOSE
@@ -275,6 +338,34 @@ bool ensure_hook() {
 #if FOV_MOD_DIAGNOSE
       diag("render orchestrator (full-frame cull bracket) detour INSTALLED at 0x%08X\n",
            static_cast<unsigned>(ofn));
+#endif
+    }
+  }
+  if (!g_pickA_hook) {
+    const uintptr_t pfn = g_gfx_base + kPickARva;
+    const bool psig_ok = !IsBadReadPtr(reinterpret_cast<void *>(pfn), sizeof(kPickASig)) &&
+                         std::memcmp(reinterpret_cast<void *>(pfn), kPickASig, sizeof(kPickASig)) == 0;
+#if FOV_MOD_DIAGNOSE
+    diag("ensure_hook: pickA_fn=0x%08X sig_ok=%d\n", static_cast<unsigned>(pfn), psig_ok ? 1 : 0);
+#endif
+    if (psig_ok) {
+      g_pickA_hook = new hook(static_cast<int>(pfn), &pickA_detour, hook_type_detour);
+#if FOV_MOD_DIAGNOSE
+      diag("click-pick A (cull-cam unproject) detour INSTALLED at 0x%08X\n", static_cast<unsigned>(pfn));
+#endif
+    }
+  }
+  if (!g_pickB_hook) {
+    const uintptr_t pfn = g_gfx_base + kPickBRva;
+    const bool psig_ok = !IsBadReadPtr(reinterpret_cast<void *>(pfn), sizeof(kPickBSig)) &&
+                         std::memcmp(reinterpret_cast<void *>(pfn), kPickBSig, sizeof(kPickBSig)) == 0;
+#if FOV_MOD_DIAGNOSE
+    diag("ensure_hook: pickB_fn=0x%08X sig_ok=%d\n", static_cast<unsigned>(pfn), psig_ok ? 1 : 0);
+#endif
+    if (psig_ok) {
+      g_pickB_hook = new hook(static_cast<int>(pfn), &pickB_detour, hook_type_detour);
+#if FOV_MOD_DIAGNOSE
+      diag("click-pick B (cull-cam unproject) detour INSTALLED at 0x%08X\n", static_cast<unsigned>(pfn));
 #endif
     }
   }
