@@ -245,10 +245,10 @@ static void handle_process_attach() {
   // (ZEAL_ROF2_LAYER0_VALIDATION) because its submodules reference 2002-client
   // addresses wrong for our binary. Signature-gated inside install() -> silent
   // no-op on mismatch, like lmb_pan.
-  // SHIP S63: NOT installed. The [Add Button] feature depends on a server-side
-  // signal that isn't confirmed live; shipping "hide-name only" leaves it out.
-  // Code preserved on the branch -- re-enable once the engine side is verified.
-  // bot_cast_button::install(aslr_delta);
+  // SHIP S65: INSTALLED. The engine signal (client_packet.cpp Handle_OP_ItemLinkClick
+  // emitting "Bot cast button ready: ...", PR #37 / a1a23f498) is verified live on
+  // master, resolving the S63 "unconfirmed signal" hold. Ships in client-pack v1.4.28.
+  bot_cast_button::install(aslr_delta);
 
   // Theo-and-Co S62: hide-your-own-overhead-name. Detours SetNameSpriteState
   // (the name-sprite show/hide decision fn) and forces show=0 for the local
