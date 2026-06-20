@@ -100,6 +100,16 @@ uintptr_t g_gfx_base = 0;     // EQGraphicsDX9.dll runtime base
 float g_fov = kDefaultFov;
 bool g_enabled = false;
 
+// S66 click-pick FIX (verified in-game): PERSIST the cull cam (B[0xd]) FOV at
+// g_fov (do NOT restore it after each render frame). The left-click target-pick
+// runs OUTSIDE the render frame and reads the cull cam, so the prior hold-then-
+// restore left it native (45) at pick time -> the click ray and the rendered
+// scene diverged (couldn't target a mob unless on top of it). Persisting keeps
+// the cull cam at g_fov so the pick aligns. Render cam (B[0xe]) is untouched ->
+// no zoom. Native FOV captured once so disable() restores it on /fov off.
+float g_cull_native = 0.0f;
+bool g_cull_captured = false;
+
 #if FOV_MOD_DIAGNOSE
 int g_frustum_calls = 0;  // log the first few FUN_10006470 calls per launch (incl. the late piVar7 build)
 bool g_logged_cull = false;
@@ -212,11 +222,16 @@ void __fastcall orch_detour(int *param_1) {
              pf ? *pf : -1.0f, g_fov);
       }
 #endif
+      // S66 click-pick FIX: PERSIST g_fov on the cull cam (no restore) so the
+      // out-of-frame click target-pick reads g_fov. Capture the native FOV once
+      // (a normal-range value that isn't already g_fov) so disable() can put it
+      // back; on later frames orig == g_fov so we keep the captured native.
       if (orig >= kOverrideLo && orig <= kOverrideHi) {
+        if (!g_cull_captured && orig != g_fov) {
+          g_cull_native = orig;
+          g_cull_captured = true;
+        }
         *pfov = g_fov;
-        g_orch_hook->original(static_cast<orch_fn>(nullptr))(param_1);
-        *pfov = orig;
-        return;
       }
     }
   }
@@ -298,6 +313,12 @@ bool set_fov(float fov) {
 
 void disable() {
   g_enabled = false;
+  // S66: restore the persisted cull cam FOV to native so /fov off isn't stuck wide.
+  if (g_cull_captured && g_gfx_base) {
+    float *pfov = cam_fov_field(kCullCamIdx);
+    if (pfov) *pfov = g_cull_native;
+    g_cull_captured = false;
+  }
   WritePrivateProfileStringA(kSection, kKeyFov, "0", kZealIni);
 }
 
